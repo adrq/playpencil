@@ -1,0 +1,14 @@
+[package]
+name = "playpencil-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compute isolation layer — cross-platform VM sandbox for running untrusted code (CLI)"
+
+[[bin]]
+name = "playpencil"
+path = "src/main.rs"
+
+[dependencies]
+playpencil-core = { path = "../playpencil-core" }
+playpencil-server = { path = "../playpencil-server" }

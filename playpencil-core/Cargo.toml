@@ -1,0 +1,12 @@
+[package]
+name = "playpencil-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compute isolation layer — cross-platform VM sandbox for running untrusted code (core)"
+
+[lib]
+name = "playpencil_core"
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
