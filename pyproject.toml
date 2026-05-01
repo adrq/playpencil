@@ -1,0 +1,20 @@
+[project]
+name = "playpencil-tests"
+version = "0.1.0"
+description = "Test infrastructure for playpencil"
+requires-python = ">=3.14"
+license = "AGPL-3.0-or-later"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-xdist>=3.5.0",
+    "httpx>=0.28.0",
+    "psutil>=6.0.0",
+    "ruff>=0.14.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "vm: tests requiring KVM (run with pytest -m vm)",
+]
