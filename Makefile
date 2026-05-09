@@ -6,6 +6,7 @@ build:
 	cargo build --release
 	mkdir -p bin
 	cp target/release/playpencil bin/
+	cp target/release/playpencil-init bin/
 
 check:
 	cargo check
