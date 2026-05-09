@@ -1,5 +1,5 @@
 [workspace]
-members = ["playpencil-core", "playpencil-server", "playpencil-cli", "playpencil-init"]
+members = ["core", "server", "cli", "init"]
 resolver = "2"
 
 [workspace.package]

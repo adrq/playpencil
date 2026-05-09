@@ -16,10 +16,10 @@ make clean      # Clean build artifacts
 
 ## Project Structure
 
-- **playpencil-core/** — Core library crate (lifecycle, policy, backends, network backend, C ABI)
-- **playpencil-server/** — HTTP server crate (OpenSandbox protocol, daemon runtime)
-- **playpencil-cli/** — CLI binary crate (`playpencil` — serve + client subcommands)
-- **playpencil-init/** — Guest init binary (PID 1 inside VMs, exec handler). Built as musl static.
+- **core/** — Core library crate (`playpencil-core`: lifecycle, policy, backends, network backend, C ABI)
+- **server/** — HTTP server crate (`playpencil-server`: OpenSandbox protocol, daemon runtime)
+- **cli/** — CLI binary crate (`playpencil-cli`: serve + client subcommands)
+- **init/** — Guest init binary (`playpencil-init`: PID 1 inside VMs, exec handler). Built as musl static.
 - **tests/** — Integration tests (Python)
 - **scripts/** — Build/publish/e2e
 
