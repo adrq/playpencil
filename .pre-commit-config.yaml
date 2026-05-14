@@ -1,0 +1,56 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=1000']  # Prevent files >1MB
+      - id: check-merge-conflict
+      - id: check-json
+      - id: check-case-conflict  # Prevent case-sensitive filename conflicts
+      - id: check-symlinks       # Check for broken symlinks
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo
+        language: system
+        args: [fmt, --all]
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo
+        language: system
+        args: [clippy, --all-targets, --all-features, --, -D, warnings]
+        files: \.rs$
+        pass_filenames: false
+      - id: rust-no-broad-allows
+        name: rust no broad allow suppressions
+        entry: bash
+        language: system
+        args:
+          - -lc
+          - |
+            set -euo pipefail
+            if grep -RInE --include='*.rs' '#!\[allow\(' core/src server/src cli/src init/src; then
+              echo 'crate-level #![allow(...)] is not allowed under src/';
+              exit 1;
+            fi
+            if grep -RInE --include='*.rs' '#\[allow\((warnings|unused|unused_imports|unused_variables|unused_mut|unused_assignments|unused_must_use)\)\]' core/src server/src cli/src init/src; then
+              echo 'broad #[allow(warnings|unused*)] is not allowed under src/';
+              exit 1;
+            fi
+        files: \.rs$
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.1
+    hooks:
+      - id: ruff-check
+        args: [ --fix, --show-fixes ]
+      - id: ruff-format

@@ -11,6 +11,7 @@ make test       # Run all tests (cargo + pytest, needs KVM)
 make test-rust  # Rust unit tests only
 make test-vm    # VM tests only (needs KVM)
 make test-ci    # CI suite (check + rust tests + non-VM pytest)
+make pre-commit  # Run pre-commit hooks on staged files
 make clean      # Clean build artifacts
 ```
 

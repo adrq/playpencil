@@ -1,4 +1,4 @@
-.PHONY: all build check test test-rust test-vm test-ci clean
+.PHONY: all build check test test-rust test-vm test-ci pre-commit clean
 
 all: build
 
@@ -23,6 +23,9 @@ test-vm: all
 
 test-ci: check test-rust
 	uv run pytest -v -m 'not vm' tests
+
+pre-commit:
+	uv run pre-commit run
 
 clean:
 	cargo clean
