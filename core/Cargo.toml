@@ -11,3 +11,6 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 serde = { workspace = true }
+krun-sys = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }

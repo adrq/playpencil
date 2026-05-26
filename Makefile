@@ -1,4 +1,10 @@
-.PHONY: all build check test test-rust test-vm test-ci pre-commit clean
+LIBKRUN_DIR ?= vendor/libkrun
+ifneq ($(wildcard $(LIBKRUN_DIR)/lib64/pkgconfig/libkrun.pc),)
+  export PKG_CONFIG_PATH := $(abspath $(LIBKRUN_DIR))/lib64/pkgconfig:$(PKG_CONFIG_PATH)
+  export LD_LIBRARY_PATH := $(abspath $(LIBKRUN_DIR))/lib64:$(LD_LIBRARY_PATH)
+endif
+
+.PHONY: all build check test test-rust test-vm test-ci pre-commit clean setup-libkrun
 
 all: build
 
@@ -26,6 +32,9 @@ test-ci: check test-rust
 
 pre-commit:
 	uv run pre-commit run
+
+setup-libkrun:
+	scripts/setup-libkrun.sh
 
 clean:
 	cargo clean
