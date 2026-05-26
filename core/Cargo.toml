@@ -10,3 +10,4 @@ name = "playpencil_core"
 crate-type = ["lib", "staticlib"]
 
 [dependencies]
+serde = { workspace = true }
