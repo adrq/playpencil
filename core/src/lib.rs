@@ -1,3 +1,4 @@
+pub mod lifecycle;
 pub mod types;
 
 pub fn version() -> &'static str {
