@@ -23,9 +23,16 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo
+        entry: bash
         language: system
-        args: [clippy, --all-targets, --all-features, --, -D, warnings]
+        args:
+          - -lc
+          - |
+            d="$(cd vendor/libkrun 2>/dev/null && pwd)"
+            if [ -n "$d" ] && [ -f "$d/lib64/pkgconfig/libkrun.pc" ]; then
+              export PKG_CONFIG_PATH="$d/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            fi
+            exec cargo clippy --all-targets --all-features -- -D warnings
         files: \.rs$
         pass_filenames: false
       - id: rust-no-broad-allows

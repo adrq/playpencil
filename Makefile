@@ -19,6 +19,7 @@ check:
 	cargo clippy -- -D warnings
 
 test: all test-rust
+	cargo build
 	uv run pytest -v tests
 
 test-rust:

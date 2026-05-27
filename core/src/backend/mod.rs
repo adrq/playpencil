@@ -1,6 +1,7 @@
+pub mod libkrun;
 pub mod mock;
 
-use crate::types::{ExecId, ExecRequest, SandboxConfig, SandboxId, SandboxStatus};
+use crate::types::{ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus};
 use std::fmt;
 
 #[derive(Debug)]
@@ -36,6 +37,6 @@ pub trait SandboxBackend {
     async fn stop(&self, id: &SandboxId) -> Result<(), BackendError>;
     async fn destroy(&self, id: &SandboxId) -> Result<(), BackendError>;
     async fn status(&self, id: &SandboxId) -> Result<SandboxStatus, BackendError>;
-    async fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecId, BackendError>;
+    async fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecHandle, BackendError>;
     fn capabilities(&self) -> Capabilities;
 }

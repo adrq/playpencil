@@ -1,111 +1,212 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::Ordering::Relaxed;
-use std::time::{Duration, Instant};
 
-use crate::SHUTDOWN_REQUESTED;
-use crate::proto::{ExecRequest, ExecResponse, base64_encode};
+use crate::proto::{GuestMessage, base64_encode};
 
-const MAX_CAPTURE: usize = 16 * 1024 * 1024; // 16MB
-const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// State of a single running exec.
+pub struct ExecEntry {
+    pub pid: libc::pid_t,
+    /// Write end of child's stdin pipe (host writes here to send stdin data).
+    pub stdin_fd: RawFd,
+    /// Read end of child's stdout pipe.
+    pub stdout_fd: RawFd,
+    /// Read end of child's stderr pipe.
+    pub stderr_fd: RawFd,
+    pub stdout_closed: bool,
+    pub stderr_closed: bool,
+    /// Exit code, set when waitpid confirms the child exited.
+    pub exit_code: Option<i32>,
+    /// Deadline after which lingering process group members are killed so pipes drain.
+    /// Set when the leader exits; None until then and cleared after the kill.
+    pub grace_deadline: Option<std::time::Instant>,
+}
 
-pub fn handle_exec(req: &ExecRequest) -> ExecResponse {
-    if req.cmd.is_empty() {
-        return error_response("empty command");
+impl ExecEntry {
+    /// True when we have collected the exit code and both output pipes are drained.
+    pub fn is_done(&self) -> bool {
+        self.exit_code.is_some() && self.stdout_closed && self.stderr_closed
     }
+}
 
-    // Validate all strings for NUL bytes before fork
-    for (i, s) in req.cmd.iter().enumerate() {
+impl Drop for ExecEntry {
+    fn drop(&mut self) {
+        close_if_open(self.stdin_fd);
+        close_if_open(self.stdout_fd);
+        close_if_open(self.stderr_fd);
+    }
+}
+
+/// Fork and start the child, returning an ExecEntry. Does not block.
+pub fn start_exec(
+    cmd: &[String],
+    env: &[String],
+    workdir: Option<&str>,
+) -> Result<ExecEntry, String> {
+    if cmd.is_empty() {
+        return Err("empty command".into());
+    }
+    for (i, s) in cmd.iter().enumerate() {
         if s.contains('\0') {
-            return error_response(&format!("cmd[{i}] contains NUL byte"));
+            return Err(format!("cmd[{i}] contains NUL byte"));
         }
     }
-    for (i, s) in req.env.iter().enumerate() {
+    for (i, s) in env.iter().enumerate() {
         if s.contains('\0') {
-            return error_response(&format!("env[{i}] contains NUL byte"));
+            return Err(format!("env[{i}] contains NUL byte"));
         }
     }
-    if let Some(ref dir) = req.workdir {
+    if let Some(dir) = workdir {
         if dir.contains('\0') {
-            return error_response("workdir contains NUL byte");
+            return Err("workdir contains NUL byte".into());
         }
-        if !std::path::Path::new(dir.as_str()).is_dir() {
-            return error_response(&format!("workdir does not exist: {dir}"));
+        if !std::path::Path::new(dir).is_dir() {
+            return Err(format!("workdir does not exist: {dir}"));
         }
     }
 
-    // Create pipes with O_CLOEXEC
-    let (stdout_r, stdout_w) = match pipe_cloexec() {
-        Ok(p) => p,
-        Err(e) => return error_response(&format!("pipe: {e}")),
-    };
-    let (stderr_r, stderr_w) = match pipe_cloexec() {
-        Ok(p) => p,
-        Err(e) => {
-            close_fd(stdout_r);
-            close_fd(stdout_w);
-            return error_response(&format!("pipe: {e}"));
-        }
-    };
+    let (stdin_r, stdin_w) = pipe_cloexec().map_err(|e| format!("pipe: {e}"))?;
+    let (stdout_r, stdout_w) = pipe_cloexec().map_err(|e| {
+        close_if_open(stdin_r);
+        close_if_open(stdin_w);
+        format!("pipe: {e}")
+    })?;
+    let (stderr_r, stderr_w) = pipe_cloexec().map_err(|e| {
+        close_if_open(stdin_r);
+        close_if_open(stdin_w);
+        close_if_open(stdout_r);
+        close_if_open(stdout_w);
+        format!("pipe: {e}")
+    })?;
 
-    // Block SIGCHLD before fork to prevent reaping race
     let old_mask = block_sigchld();
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         restore_sigmask(&old_mask);
-        close_fd(stdout_r);
-        close_fd(stdout_w);
-        close_fd(stderr_r);
-        close_fd(stderr_w);
-        return error_response(&format!("fork: {}", io::Error::last_os_error()));
+        close_if_open(stdin_r);
+        close_if_open(stdin_w);
+        close_if_open(stdout_r);
+        close_if_open(stdout_w);
+        close_if_open(stderr_r);
+        close_if_open(stderr_w);
+        return Err(format!("fork: {}", io::Error::last_os_error()));
     }
 
     if pid == 0 {
-        // Child
-        child_exec(req, stdout_w, stderr_w, stdout_r, stderr_r, &old_mask);
+        // Child: set up stdio and exec
+        let fds = ChildFds {
+            stdin_r,
+            stdin_w,
+            stdout_r,
+            stdout_w,
+            stderr_r,
+            stderr_w,
+        };
+        child_exec(cmd, env, workdir, fds, &old_mask);
     }
 
     // Parent
-    // Set child's process group (race-free with child's setpgid(0,0))
+    restore_sigmask(&old_mask);
+    // Race-free: set child's process group
     let _ = unsafe { libc::setpgid(pid, pid) };
 
-    close_fd(stdout_w);
-    close_fd(stderr_w);
+    // Close child-side fds in parent
+    close_if_open(stdin_r);
+    close_if_open(stdout_w);
+    close_if_open(stderr_w);
 
-    let (stdout_data, stderr_data, exit_code) = exec_and_drain(pid, stdout_r, stderr_r);
+    Ok(ExecEntry {
+        pid,
+        stdin_fd: stdin_w,
+        stdout_fd: stdout_r,
+        stderr_fd: stderr_r,
+        stdout_closed: false,
+        stderr_closed: false,
+        exit_code: None,
+        grace_deadline: None,
+    })
+}
 
-    close_fd(stdout_r);
-    close_fd(stderr_r);
-
-    // Kill any remaining descendants in the process group
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    reap_group();
-
-    // Unblock SIGCHLD and reap any orphans
-    restore_sigmask(&old_mask);
-    crate::reap_children();
-
-    ExecResponse {
-        exit_code,
-        stdout: base64_encode(&stdout_data),
-        stderr: base64_encode(&stderr_data),
+/// Read available data from a pipe fd, encode it, and return a GuestMessage.
+/// Returns None if the pipe is closed (EOF). Returns Some(msg) if data was read.
+/// Returns Err on I/O error.
+///
+/// The returned bool indicates whether the fd is now closed.
+pub fn read_pipe_chunk(exec_id: &str, fd: RawFd, is_stderr: bool) -> (Option<GuestMessage>, bool) {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Error on read — treat as closed
+            return (None, true);
+        }
+        if n == 0 {
+            // EOF
+            return (None, true);
+        }
+        let data = base64_encode(&buf[..n as usize]);
+        let msg = if is_stderr {
+            GuestMessage::Stderr {
+                id: exec_id.to_string(),
+                data,
+            }
+        } else {
+            GuestMessage::Stdout {
+                id: exec_id.to_string(),
+                data,
+            }
+        };
+        return (Some(msg), false);
     }
 }
 
-fn child_exec(
-    req: &ExecRequest,
-    stdout_w: RawFd,
-    stderr_w: RawFd,
+/// Non-blocking waitpid check. Returns Some(exit_code) if child has exited.
+pub fn check_child_exit(pid: libc::pid_t) -> Option<i32> {
+    loop {
+        let mut status: libc::c_int = 0;
+        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if w == pid {
+            return Some(decode_exit_status(status));
+        }
+        if w < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+}
+
+struct ChildFds {
+    stdin_r: RawFd,
+    stdin_w: RawFd,
     stdout_r: RawFd,
+    stdout_w: RawFd,
     stderr_r: RawFd,
+    stderr_w: RawFd,
+}
+
+fn child_exec(
+    cmd: &[String],
+    env: &[String],
+    workdir: Option<&str>,
+    fds: ChildFds,
     old_mask: &libc::sigset_t,
 ) -> ! {
-    // Unblock SIGCHLD
+    let ChildFds {
+        stdin_r,
+        stdin_w,
+        stdout_r,
+        stdout_w,
+        stderr_r,
+        stderr_w,
+    } = fds;
     restore_sigmask(old_mask);
 
-    // Reset signal dispositions to default before exec
+    // Reset signal dispositions
     unsafe {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -115,54 +216,47 @@ fn child_exec(
     // Own process group
     unsafe { libc::setpgid(0, 0) };
 
-    // Close pipe read ends (not needed in child)
-    close_fd(stdout_r);
-    close_fd(stderr_r);
+    // Close parent-side fds not needed in child
+    close_if_open(stdin_w);
+    close_if_open(stdout_r);
+    close_if_open(stderr_r);
 
-    // Move pipe write fds above 2 to avoid collisions with stdio.
-    // F_DUPFD_CLOEXEC gives us a new fd >= 3 with CLOEXEC set.
+    // Move pipe fds above 2 before dup2 to avoid collisions
+    let in_r = move_fd_above_stdio(stdin_r);
     let out_w = move_fd_above_stdio(stdout_w);
     let err_w = move_fd_above_stdio(stderr_w);
-    if out_w < 0 || err_w < 0 {
+    if in_r < 0 || out_w < 0 || err_w < 0 {
         unsafe { libc::_exit(126) };
     }
 
-    // stdin -> /dev/null
-    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if devnull < 0 || unsafe { libc::dup2(devnull, 0) } < 0 {
+    // Redirect stdin/stdout/stderr
+    if unsafe { libc::dup2(in_r, 0) } < 0
+        || unsafe { libc::dup2(out_w, 1) } < 0
+        || unsafe { libc::dup2(err_w, 2) } < 0
+    {
         unsafe { libc::_exit(126) };
     }
-    if devnull != 0 {
-        close_fd(devnull);
-    }
+    // O_CLOEXEC on in_r/out_w/err_w auto-closes them on exec
+    close_if_open(in_r);
+    close_if_open(out_w);
+    close_if_open(err_w);
 
-    // stdout/stderr redirection
-    if unsafe { libc::dup2(out_w, 1) } < 0 || unsafe { libc::dup2(err_w, 2) } < 0 {
-        unsafe { libc::_exit(126) };
-    }
-    // O_CLOEXEC on out_w/err_w means they auto-close on exec
-    // But close them now since we have the dup'd copies on 1/2
-    close_fd(out_w);
-    close_fd(err_w);
-
-    // Working directory (validated before fork, CString safe — no NUL bytes)
-    if let Some(ref dir) = req.workdir {
-        let c_dir = CString::new(dir.as_str()).unwrap();
-        let ret = unsafe { libc::chdir(c_dir.as_ptr()) };
-        if ret < 0 {
+    // Working directory
+    if let Some(dir) = workdir {
+        let c_dir = CString::new(dir).unwrap();
+        if unsafe { libc::chdir(c_dir.as_ptr()) } < 0 {
             unsafe { libc::_exit(126) };
         }
     }
 
-    // Environment variables (validated before fork — no NUL bytes)
-    for env_str in &req.env {
+    // Environment variables
+    for env_str in env {
         let c_env = CString::new(env_str.as_str()).unwrap();
         unsafe { libc::putenv(c_env.into_raw()) };
     }
 
-    // Build argv for execvp (validated before fork — no NUL bytes)
-    let c_args: Vec<CString> = req
-        .cmd
+    // Build argv
+    let c_args: Vec<CString> = cmd
         .iter()
         .map(|s| CString::new(s.as_str()).unwrap())
         .collect();
@@ -170,211 +264,7 @@ fn child_exec(
     argv.push(std::ptr::null());
 
     unsafe { libc::execvp(argv[0], argv.as_ptr()) };
-    // If execvp returns, it failed
     unsafe { libc::_exit(127) };
-}
-
-/// Combined poll loop: drain pipes and check child exit concurrently.
-fn exec_and_drain(child_pid: i32, stdout_fd: RawFd, stderr_fd: RawFd) -> (Vec<u8>, Vec<u8>, i32) {
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut child_exited = false;
-    let mut exit_code: i32 = -1;
-    let mut drain_deadline: Option<Instant> = None;
-
-    loop {
-        // Check shutdown
-        if SHUTDOWN_REQUESTED.load(Relaxed) && !child_exited {
-            if let Some(code) = shutdown_child(child_pid) {
-                exit_code = code;
-            } else {
-                exit_code = collect_exit(child_pid);
-            }
-            child_exited = true;
-            drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
-        }
-
-        // Build pollfd array for open pipes
-        let mut pfds = Vec::new();
-        if stdout_open {
-            pfds.push(libc::pollfd {
-                fd: stdout_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-        }
-        if stderr_open {
-            pfds.push(libc::pollfd {
-                fd: stderr_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-        }
-
-        if pfds.is_empty() {
-            // Both pipes closed
-            if !child_exited {
-                exit_code = collect_exit(child_pid);
-            }
-            break;
-        }
-
-        // Use short timeout if draining after child exit
-        let timeout = if drain_deadline.is_some() { 50 } else { 100 };
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as u64, timeout) };
-
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-
-        // Read from ready pipes
-        for pfd in &pfds {
-            if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                let mut tmp = [0u8; 8192];
-                let n =
-                    unsafe { libc::read(pfd.fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue; // Retry on EINTR
-                    }
-                    if pfd.fd == stdout_fd {
-                        stdout_open = false;
-                    }
-                    if pfd.fd == stderr_fd {
-                        stderr_open = false;
-                    }
-                } else if n == 0 {
-                    // EOF
-                    if pfd.fd == stdout_fd {
-                        stdout_open = false;
-                    }
-                    if pfd.fd == stderr_fd {
-                        stderr_open = false;
-                    }
-                } else {
-                    let data = &tmp[..n as usize];
-                    let buf = if pfd.fd == stdout_fd {
-                        &mut stdout_buf
-                    } else {
-                        &mut stderr_buf
-                    };
-                    // Bounded capture: store first 16MB, discard rest
-                    if buf.len() < MAX_CAPTURE {
-                        let remaining = MAX_CAPTURE - buf.len();
-                        buf.extend_from_slice(&data[..data.len().min(remaining)]);
-                    }
-                    // Keep reading (drain-and-discard) to prevent child blocking
-                }
-            }
-        }
-
-        // Check child exit (non-blocking)
-        if !child_exited {
-            let mut status: libc::c_int = 0;
-            let w = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-            if w == child_pid {
-                exit_code = decode_exit_status(status);
-                child_exited = true;
-                drain_deadline = Some(Instant::now() + DRAIN_TIMEOUT);
-            }
-        }
-
-        // Drain timeout expired: stop
-        if let Some(deadline) = drain_deadline
-            && Instant::now() >= deadline
-        {
-            break;
-        }
-    }
-
-    (stdout_buf, stderr_buf, exit_code)
-}
-
-/// Returns Some(exit_code) if the child was reaped, None if SIGKILL was sent
-/// but reaping is left to the caller.
-fn shutdown_child(pid: i32) -> Option<i32> {
-    unsafe { libc::kill(-pid, libc::SIGTERM) };
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let mut status: libc::c_int = 0;
-        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if w == pid {
-            return Some(decode_exit_status(status));
-        }
-        if Instant::now() >= deadline {
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Non-blocking collect with SIGTERM awareness. Polls waitpid(WNOHANG)
-/// so SIGTERM can interrupt the wait.
-fn collect_exit(pid: i32) -> i32 {
-    loop {
-        let mut status: libc::c_int = 0;
-        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if w == pid {
-            return decode_exit_status(status);
-        }
-        if w < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return -1;
-        }
-        // Child still running — check if we need to shut down
-        if SHUTDOWN_REQUESTED.load(Relaxed) {
-            if let Some(code) = shutdown_child(pid) {
-                return code;
-            }
-            // SIGKILL sent, blocking wait to collect (retry on EINTR)
-            loop {
-                let w2 = unsafe { libc::waitpid(pid, &mut status, 0) };
-                if w2 == pid {
-                    return decode_exit_status(status);
-                }
-                if w2 < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return -1;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn decode_exit_status(status: libc::c_int) -> i32 {
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        -1
-    }
-}
-
-fn reap_group() {
-    loop {
-        let mut status: libc::c_int = 0;
-        let w = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if w > 0 {
-            continue;
-        }
-        if w < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        break;
-    }
 }
 
 fn pipe_cloexec() -> Result<(RawFd, RawFd), io::Error> {
@@ -386,22 +276,31 @@ fn pipe_cloexec() -> Result<(RawFd, RawFd), io::Error> {
     Ok((fds[0], fds[1]))
 }
 
-/// Move an fd to >= 3 so it doesn't collide with stdin/stdout/stderr.
-/// Returns the new fd (with CLOEXEC set), or -1 on error.
-/// Closes the original fd if it was moved.
 fn move_fd_above_stdio(fd: RawFd) -> RawFd {
     if fd > 2 {
         return fd;
     }
     let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if new_fd >= 0 {
-        close_fd(fd);
+        close_if_open(fd);
     }
     new_fd
 }
 
-fn close_fd(fd: RawFd) {
-    unsafe { libc::close(fd) };
+fn close_if_open(fd: RawFd) {
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+}
+
+fn decode_exit_status(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
 }
 
 fn block_sigchld() -> libc::sigset_t {
@@ -418,13 +317,5 @@ fn block_sigchld() -> libc::sigset_t {
 fn restore_sigmask(mask: &libc::sigset_t) {
     unsafe {
         libc::sigprocmask(libc::SIG_SETMASK, mask, std::ptr::null_mut());
-    }
-}
-
-fn error_response(msg: &str) -> ExecResponse {
-    ExecResponse {
-        exit_code: -1,
-        stdout: base64_encode(b""),
-        stderr: base64_encode(msg.as_bytes()),
     }
 }

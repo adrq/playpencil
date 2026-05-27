@@ -25,6 +25,7 @@ tar = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+tokio-util = { workspace = true }
 zstd = { workspace = true }
 url = { workspace = true }
 

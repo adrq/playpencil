@@ -7,7 +7,14 @@ use std::fmt;
 pub enum SandboxState {
     Creating,
     Ready,
+    /// Transient: start() has claimed the entry but has not yet forked the VM.
+    /// Prevents a second concurrent start() from racing through the Ready/Stopped check.
+    Starting,
     Running,
+    /// Transient: stop() has started but kill_and_wait has not completed.
+    /// Prevents a concurrent start() from seeing Stopped and launching a new VM
+    /// while the old one is still alive.
+    Stopping,
     Stopped,
     Destroyed,
 }
@@ -19,11 +26,21 @@ impl SandboxState {
             (self, target),
             (Self::Creating, Self::Ready)
                 | (Self::Creating, Self::Destroyed)
-                | (Self::Ready, Self::Running)
+                | (Self::Ready, Self::Starting)
+                | (Self::Ready, Self::Running) // kept for MockBackend
                 | (Self::Ready, Self::Destroyed)
-                | (Self::Running, Self::Stopped)
+                | (Self::Starting, Self::Running)
+                | (Self::Starting, Self::Ready) // rollback on start() failure from Ready
+                | (Self::Starting, Self::Stopped) // rollback on start() failure from Stopped
+                | (Self::Starting, Self::Destroyed)
+                | (Self::Running, Self::Stopping)
+                | (Self::Running, Self::Stopped) // kept for MockBackend
                 | (Self::Running, Self::Destroyed)
-                | (Self::Stopped, Self::Running)
+                | (Self::Stopping, Self::Stopped)
+                // Stopping → Destroyed is intentionally absent: destroy() must wait for
+                // stop() to complete (rootfs may still be in use by the running VM).
+                | (Self::Stopped, Self::Starting)
+                | (Self::Stopped, Self::Running) // kept for MockBackend
                 | (Self::Stopped, Self::Destroyed)
         )
     }
@@ -44,7 +61,9 @@ impl fmt::Display for SandboxState {
         let s = match self {
             Self::Creating => "creating",
             Self::Ready => "ready",
+            Self::Starting => "starting",
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Stopped => "stopped",
             Self::Destroyed => "destroyed",
         };

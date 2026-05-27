@@ -57,3 +57,38 @@ pub enum ExecEvent {
     Stderr(Vec<u8>),
     Exit { code: i32 },
 }
+
+/// Control messages for a running exec session (signals, terminal resize).
+pub enum ExecControl {
+    Signal(i32),
+    Resize { cols: u16, rows: u16 },
+}
+
+pub struct ExecHandle {
+    pub exec_id: ExecId,
+    /// Receives stdout/stderr/exit events from the running process.
+    pub events: tokio::sync::mpsc::Receiver<ExecEvent>,
+    /// Send raw bytes to the process's stdin.
+    pub stdin: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Send control messages (signals, resize) to the running process.
+    pub control: tokio::sync::mpsc::Sender<ExecControl>,
+}
+
+impl ExecHandle {
+    /// Send a signal to the process's process group.
+    pub async fn signal(
+        &self,
+        sig: i32,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<ExecControl>> {
+        self.control.send(ExecControl::Signal(sig)).await
+    }
+
+    /// Request a terminal resize for the process.
+    pub async fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<ExecControl>> {
+        self.control.send(ExecControl::Resize { cols, rows }).await
+    }
+}

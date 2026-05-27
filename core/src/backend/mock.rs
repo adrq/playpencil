@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::lifecycle::SandboxState;
-use crate::types::{ExecId, ExecRequest, SandboxConfig, SandboxId, SandboxStatus};
+use crate::types::{ExecHandle, ExecId, ExecRequest, SandboxConfig, SandboxId, SandboxStatus};
 
 use super::{BackendError, Capabilities, SandboxBackend};
 
@@ -92,13 +92,23 @@ impl SandboxBackend for MockBackend {
         })
     }
 
-    async fn exec(&self, id: &SandboxId, _req: ExecRequest) -> Result<ExecId, BackendError> {
+    async fn exec(&self, id: &SandboxId, _req: ExecRequest) -> Result<ExecHandle, BackendError> {
         let map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(id).ok_or(BackendError::NotFound)?;
         if entry.state != SandboxState::Running {
             return Err(BackendError::InvalidState);
         }
-        Ok(ExecId(self.next_id("exec")))
+        let exec_id = ExecId(self.next_id("exec"));
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::channel(64);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(16);
+        drop(events_tx); // No process running in mock — close sender immediately.
+        Ok(ExecHandle {
+            exec_id,
+            events: events_rx,
+            stdin: stdin_tx,
+            control: ctrl_tx,
+        })
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -240,8 +250,8 @@ mod tests {
             working_dir: None,
             env: vec![],
         };
-        let exec_id = backend.exec(&id, req).await.unwrap();
-        assert!(exec_id.0.starts_with("exec-"));
+        let handle = backend.exec(&id, req).await.unwrap();
+        assert!(handle.exec_id.0.starts_with("exec-"));
     }
 
     #[tokio::test]
@@ -272,9 +282,9 @@ mod tests {
             working_dir: None,
             env: vec![],
         };
-        let eid1 = backend.exec(&id, req1).await.unwrap();
-        let eid2 = backend.exec(&id, req2).await.unwrap();
-        assert_ne!(eid1, eid2);
+        let h1 = backend.exec(&id, req1).await.unwrap();
+        let h2 = backend.exec(&id, req2).await.unwrap();
+        assert_ne!(h1.exec_id, h2.exec_id);
     }
 
     #[tokio::test]

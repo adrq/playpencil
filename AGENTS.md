@@ -2,6 +2,10 @@
 
 Compute isolation layer. Cross-platform VM sandbox for running untrusted code (Linux + macOS, no root).
 
+## Prerequisites
+
+- **libkrun**: Required for building the core crate. Run `make setup-libkrun` to download and set up `vendor/libkrun/` with headers and pkg-config files. The build system and pre-commit hooks expect `vendor/libkrun/lib64/pkgconfig/libkrun.pc` to exist.
+
 ## Common Commands
 
 ```bash

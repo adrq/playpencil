@@ -827,13 +827,6 @@ impl KrunCtx {
         check_ret("krun_add_input_device_fd", ret)
     }
 
-    /// Enable or disable the sound device.
-    pub fn set_snd_device(&mut self, enable: bool) -> Result<()> {
-        check_ret("krun_set_snd_device", unsafe {
-            krun_sys::krun_set_snd_device(self.id, enable)
-        })
-    }
-
     /// Fork and start the VM. Returns the child PID to the parent.
     ///
     /// The child calls `krun_start_enter()` (never returns) after setting

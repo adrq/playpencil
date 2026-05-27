@@ -2,7 +2,17 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 
+use serde::Deserialize;
+
 use crate::Error;
+
+/// An entry from /etc/playpencil/mounts.json describing a virtiofs mount.
+#[derive(Debug, Deserialize)]
+pub struct MountEntry {
+    pub tag: String,
+    pub guest_path: String,
+    pub read_only: bool,
+}
 
 pub fn bootstrap_mounts() -> Result<(), Error> {
     // /proc first — we need /proc/mounts for subsequent checks
@@ -38,6 +48,23 @@ pub fn bootstrap_mounts() -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// Read and parse /etc/playpencil/mounts.json.
+/// Returns empty list if the file is absent. Returns Err if the file exists but is malformed.
+pub fn read_playpencil_mounts() -> Result<Vec<MountEntry>, Error> {
+    match fs::read_to_string("/etc/playpencil/mounts.json") {
+        Ok(content) => serde_json::from_str(&content).map_err(|e| Error::Io(io::Error::other(e))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
+/// Mount a virtiofs tag at the given guest path. Creates the path if missing.
+pub fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) -> Result<(), Error> {
+    fs::create_dir_all(guest_path).map_err(Error::Io)?;
+    let flags: u64 = if read_only { libc::MS_RDONLY } else { 0 };
+    try_mount(tag, guest_path, "virtiofs", flags)
 }
 
 fn try_mount(source: &str, target: &str, fstype: &str, flags: u64) -> Result<(), Error> {

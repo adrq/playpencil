@@ -51,6 +51,11 @@ impl Console {
         use std::os::unix::io::AsRawFd;
         self.file.as_raw_fd()
     }
+
+    /// Expose the underlying fd for use in external poll() calls.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.raw_fd()
+    }
 }
 
 /// Discover the exec port and open it, retrying both steps together.

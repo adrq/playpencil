@@ -1,4 +1,4 @@
-"""Integration tests for playpencil-init exec protocol via PLAYPENCIL_EXEC_FD."""
+"""Integration tests for playpencil-init multiplexed exec protocol via PLAYPENCIL_EXEC_FD."""
 
 import base64
 import json
@@ -53,143 +53,223 @@ def init_process():
         proc.wait()
 
 
-def send_request(sock, request):
-    """Send a JSON request and read the JSON response."""
-    line = json.dumps(request) + "\n"
-    sock.sendall(line.encode())
+class ExecHelper:
+    """Helper to send multiplexed exec messages and collect streaming responses."""
 
-    # Read response line
-    buf = b""
-    while b"\n" not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("init process closed connection")
-        buf += chunk
+    def __init__(self, sock):
+        self.sock = sock
+        self._buf = b""
 
-    line_end = buf.index(b"\n")
-    return json.loads(buf[:line_end])
+    def _readline(self):
+        while b"\n" not in self._buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("init process closed connection")
+            self._buf += chunk
+        idx = self._buf.index(b"\n")
+        line = self._buf[:idx]
+        self._buf = self._buf[idx + 1 :]
+        return json.loads(line)
 
+    def send_raw(self, obj):
+        """Send a raw JSON message."""
+        self.sock.sendall((json.dumps(obj) + "\n").encode())
 
-def decode_field(b64_str):
-    """Decode a base64-encoded response field."""
-    return base64.b64decode(b64_str)
+    def run(self, exec_id, cmd, env=None, workdir=None):
+        """Send an exec message and collect all events until exit.
+
+        Returns dict with keys: exit_code, stdout (bytes), stderr (bytes).
+        """
+        msg = {"type": "exec", "id": exec_id, "cmd": cmd}
+        if env:
+            msg["env"] = env
+        if workdir:
+            msg["workdir"] = workdir
+        self.send_raw(msg)
+
+        stdout_parts = []
+        stderr_parts = []
+        exit_code = None
+
+        while exit_code is None:
+            event = self._readline()
+            if event.get("id") != exec_id:
+                continue
+            t = event["type"]
+            if t == "stdout":
+                stdout_parts.append(base64.b64decode(event["data"]))
+            elif t == "stderr":
+                stderr_parts.append(base64.b64decode(event["data"]))
+            elif t == "exit":
+                exit_code = event["code"]
+
+        return {
+            "exit_code": exit_code,
+            "stdout": b"".join(stdout_parts),
+            "stderr": b"".join(stderr_parts),
+        }
 
 
 def test_basic_echo(init_process):
     proc, sock = init_process
-    resp = send_request(sock, {"cmd": ["echo", "hello world"]})
-    assert resp["exit_code"] == 0
-    assert decode_field(resp["stdout"]) == b"hello world\n"
-    assert decode_field(resp["stderr"]) == b""
+    h = ExecHelper(sock)
+    result = h.run("e1", ["echo", "hello world"])
+    assert result["exit_code"] == 0
+    assert result["stdout"] == b"hello world\n"
+    assert result["stderr"] == b""
 
 
 def test_nonzero_exit_code(init_process):
     proc, sock = init_process
-    resp = send_request(sock, {"cmd": ["sh", "-c", "exit 42"]})
-    assert resp["exit_code"] == 42
+    h = ExecHelper(sock)
+    result = h.run("e1", ["sh", "-c", "exit 42"])
+    assert result["exit_code"] == 42
 
 
 def test_stdout_stderr_separation(init_process):
     proc, sock = init_process
-    resp = send_request(
-        sock,
-        {
-            "cmd": ["sh", "-c", "echo out; echo err >&2"],
-        },
-    )
-    assert resp["exit_code"] == 0
-    assert decode_field(resp["stdout"]) == b"out\n"
-    assert decode_field(resp["stderr"]) == b"err\n"
+    h = ExecHelper(sock)
+    result = h.run("e1", ["sh", "-c", "echo out; echo err >&2"])
+    assert result["exit_code"] == 0
+    assert result["stdout"] == b"out\n"
+    assert result["stderr"] == b"err\n"
 
 
 def test_base64_binary_output(init_process):
     proc, sock = init_process
-    resp = send_request(
-        sock,
-        {
-            "cmd": ["printf", "\\x00\\x01\\x02\\xff"],
-        },
-    )
-    assert resp["exit_code"] == 0
-    decoded = decode_field(resp["stdout"])
-    assert decoded == b"\x00\x01\x02\xff"
+    h = ExecHelper(sock)
+    result = h.run("e1", ["printf", "\\x00\\x01\\x02\\xff"])
+    assert result["exit_code"] == 0
+    assert result["stdout"] == b"\x00\x01\x02\xff"
 
 
-def test_invalid_json_request(init_process):
+def test_invalid_json_is_non_fatal(init_process):
+    """Init should log the error and continue — no response is sent for bad JSON."""
     proc, sock = init_process
+    h = ExecHelper(sock)
     sock.sendall(b"this is not json\n")
-
-    buf = b""
-    while b"\n" not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-
-    resp = json.loads(buf.split(b"\n")[0])
-    assert resp["exit_code"] == -1
-    stderr_text = decode_field(resp["stderr"]).decode()
-    assert "invalid request" in stderr_text
+    # After the garbage, a valid exec should still work.
+    result = h.run("e2", ["echo", "still alive"])
+    assert result["exit_code"] == 0
+    assert result["stdout"] == b"still alive\n"
 
 
 def test_empty_cmd(init_process):
     proc, sock = init_process
-    resp = send_request(sock, {"cmd": []})
-    assert resp["exit_code"] == -1
-    stderr_text = decode_field(resp["stderr"]).decode()
-    assert "empty command" in stderr_text
+    h = ExecHelper(sock)
+    result = h.run("e1", [])
+    assert result["exit_code"] == -1
+    assert b"empty command" in result["stderr"]
 
 
 def test_workdir(init_process):
     proc, sock = init_process
-    resp = send_request(sock, {"cmd": ["pwd"], "workdir": "/tmp"})
-    assert resp["exit_code"] == 0
-    assert decode_field(resp["stdout"]).strip() == b"/tmp"
+    h = ExecHelper(sock)
+    result = h.run("e1", ["pwd"], workdir="/tmp")
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == b"/tmp"
 
 
 def test_env_vars(init_process):
     proc, sock = init_process
-    resp = send_request(
-        sock,
-        {
-            "cmd": ["sh", "-c", "echo $MY_VAR"],
-            "env": ["MY_VAR=test_value"],
-        },
-    )
-    assert resp["exit_code"] == 0
-    assert decode_field(resp["stdout"]).strip() == b"test_value"
+    h = ExecHelper(sock)
+    result = h.run("e1", ["sh", "-c", "echo $MY_VAR"], env=["MY_VAR=test_value"])
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == b"test_value"
 
 
 def test_command_not_found(init_process):
     proc, sock = init_process
-    resp = send_request(sock, {"cmd": ["nonexistent_command_xyz"]})
-    # execvp fails -> child exits 127
-    assert resp["exit_code"] == 127
+    h = ExecHelper(sock)
+    result = h.run("e1", ["nonexistent_command_xyz"])
+    # execvp fails → child exits 127
+    assert result["exit_code"] == 127
 
 
 def test_multiple_sequential_execs(init_process):
     proc, sock = init_process
+    h = ExecHelper(sock)
     for i in range(5):
-        resp = send_request(sock, {"cmd": ["echo", str(i)]})
-        assert resp["exit_code"] == 0
-        assert decode_field(resp["stdout"]).strip() == str(i).encode()
+        result = h.run(f"e{i}", ["echo", str(i)])
+        assert result["exit_code"] == 0
+        assert result["stdout"].strip() == str(i).encode()
 
 
 def test_large_output(init_process):
-    """Verify large output is captured up to the 16MB cap."""
+    """Verify large output is fully streamed and reassembled."""
     proc, sock = init_process
-    # Generate ~1MB of output
-    resp = send_request(
-        sock,
-        {
-            "cmd": [
-                "sh",
-                "-c",
-                "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | base64",
-            ],
-        },
+    h = ExecHelper(sock)
+    result = h.run(
+        "e1",
+        ["sh", "-c", "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | base64"],
     )
-    assert resp["exit_code"] == 0
-    stdout = decode_field(resp["stdout"])
-    # base64 of 1MB zero = ~1.37MB, should be fully captured
-    assert len(stdout) > 1_000_000
+    assert result["exit_code"] == 0
+    # base64 of 1 MB zeros ≈ 1.37 MB
+    assert len(result["stdout"]) > 1_000_000
+
+
+def test_concurrent_execs(init_process):
+    """Send two execs back-to-back; both should complete independently."""
+    proc, sock = init_process
+    h = ExecHelper(sock)
+
+    # Send both exec messages before consuming any responses.
+    h.send_raw({"type": "exec", "id": "a", "cmd": ["sh", "-c", "sleep 0.05; echo A"]})
+    h.send_raw({"type": "exec", "id": "b", "cmd": ["echo", "B"]})
+
+    results: dict = {}
+    pending = {"a", "b"}
+    while pending:
+        event = h._readline()
+        eid = event.get("id")
+        if eid not in pending:
+            continue
+        t = event["type"]
+        if t == "stdout":
+            results.setdefault(eid, {}).setdefault("stdout", b"")
+            results[eid]["stdout"] += base64.b64decode(event["data"])
+        elif t == "exit":
+            results.setdefault(eid, {})["exit_code"] = event["code"]
+            pending.discard(eid)
+
+    assert results["a"]["exit_code"] == 0
+    assert results["a"]["stdout"].strip() == b"A"
+    assert results["b"]["exit_code"] == 0
+    assert results["b"]["stdout"].strip() == b"B"
+
+
+def test_stdin_forwarding(init_process):
+    """Send stdin data to a running process and close stdin via empty-data EOF."""
+    proc, sock = init_process
+    h = ExecHelper(sock)
+
+    exec_id = "e1"
+    h.send_raw({"type": "exec", "id": exec_id, "cmd": ["cat"]})
+
+    data = b"hello from stdin\n"
+    h.send_raw(
+        {
+            "type": "stdin",
+            "id": exec_id,
+            "data": base64.b64encode(data).decode(),
+        }
+    )
+    # Empty data = EOF: init closes the write end of the stdin pipe.
+    # cat sees EOF, flushes and exits with code 0.
+    h.send_raw({"type": "stdin", "id": exec_id, "data": ""})
+
+    stdout_parts = []
+    exit_code = None
+    while exit_code is None:
+        event = h._readline()
+        if event.get("id") != exec_id:
+            continue
+        t = event["type"]
+        if t == "stdout":
+            stdout_parts.append(base64.b64decode(event["data"]))
+        elif t == "exit":
+            exit_code = event["code"]
+
+    stdout = b"".join(stdout_parts)
+    assert exit_code == 0
+    assert data in stdout
