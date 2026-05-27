@@ -37,7 +37,7 @@ impl Default for MockBackend {
 }
 
 impl SandboxBackend for MockBackend {
-    fn create(&self, _config: SandboxConfig) -> Result<SandboxId, BackendError> {
+    async fn create(&self, _config: SandboxConfig) -> Result<SandboxId, BackendError> {
         let id = SandboxId(self.next_id("mock"));
 
         let state = SandboxState::Creating
@@ -52,7 +52,7 @@ impl SandboxBackend for MockBackend {
         Ok(id)
     }
 
-    fn start(&self, id: &SandboxId) -> Result<(), BackendError> {
+    async fn start(&self, id: &SandboxId) -> Result<(), BackendError> {
         let mut map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get_mut(id).ok_or(BackendError::NotFound)?;
         entry.state = entry
@@ -62,7 +62,7 @@ impl SandboxBackend for MockBackend {
         Ok(())
     }
 
-    fn stop(&self, id: &SandboxId) -> Result<(), BackendError> {
+    async fn stop(&self, id: &SandboxId) -> Result<(), BackendError> {
         let mut map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get_mut(id).ok_or(BackendError::NotFound)?;
         entry.state = entry
@@ -72,7 +72,7 @@ impl SandboxBackend for MockBackend {
         Ok(())
     }
 
-    fn destroy(&self, id: &SandboxId) -> Result<(), BackendError> {
+    async fn destroy(&self, id: &SandboxId) -> Result<(), BackendError> {
         let mut map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get_mut(id).ok_or(BackendError::NotFound)?;
         entry.state = entry
@@ -82,7 +82,7 @@ impl SandboxBackend for MockBackend {
         Ok(())
     }
 
-    fn status(&self, id: &SandboxId) -> Result<SandboxStatus, BackendError> {
+    async fn status(&self, id: &SandboxId) -> Result<SandboxStatus, BackendError> {
         let map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(id).ok_or(BackendError::NotFound)?;
         Ok(SandboxStatus {
@@ -92,7 +92,7 @@ impl SandboxBackend for MockBackend {
         })
     }
 
-    fn exec(&self, id: &SandboxId, _req: ExecRequest) -> Result<ExecId, BackendError> {
+    async fn exec(&self, id: &SandboxId, _req: ExecRequest) -> Result<ExecId, BackendError> {
         let map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(id).ok_or(BackendError::NotFound)?;
         if entry.state != SandboxState::Running {
@@ -129,139 +129,139 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_returns_unique_ids() {
+    #[tokio::test]
+    async fn test_create_returns_unique_ids() {
         let backend = MockBackend::new();
-        let id1 = backend.create(test_config()).unwrap();
-        let id2 = backend.create(test_config()).unwrap();
+        let id1 = backend.create(test_config()).await.unwrap();
+        let id2 = backend.create(test_config()).await.unwrap();
         assert_ne!(id1, id2);
     }
 
-    #[test]
-    fn test_create_status_is_ready() {
+    #[tokio::test]
+    async fn test_create_status_is_ready() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "ready");
         assert!(status.created_at.is_none());
     }
 
-    #[test]
-    fn test_start_transitions_to_running() {
+    #[tokio::test]
+    async fn test_start_transitions_to_running() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "running");
     }
 
-    #[test]
-    fn test_stop_transitions_to_stopped() {
+    #[tokio::test]
+    async fn test_stop_transitions_to_stopped() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        backend.stop(&id).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        backend.stop(&id).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "stopped");
     }
 
-    #[test]
-    fn test_destroy_transitions_to_destroyed() {
+    #[tokio::test]
+    async fn test_destroy_transitions_to_destroyed() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.destroy(&id).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.destroy(&id).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "destroyed");
     }
 
-    #[test]
-    fn test_destroy_from_running() {
+    #[tokio::test]
+    async fn test_destroy_from_running() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        backend.destroy(&id).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        backend.destroy(&id).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "destroyed");
     }
 
-    #[test]
-    fn test_destroy_from_stopped() {
+    #[tokio::test]
+    async fn test_destroy_from_stopped() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        backend.stop(&id).unwrap();
-        backend.destroy(&id).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        backend.stop(&id).await.unwrap();
+        backend.destroy(&id).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "destroyed");
     }
 
-    #[test]
-    fn test_start_not_found() {
+    #[tokio::test]
+    async fn test_start_not_found() {
         let backend = MockBackend::new();
-        let result = backend.start(&SandboxId("bogus".into()));
+        let result = backend.start(&SandboxId("bogus".into())).await;
         assert!(matches!(result, Err(BackendError::NotFound)));
     }
 
-    #[test]
-    fn test_restart_from_stopped() {
+    #[tokio::test]
+    async fn test_restart_from_stopped() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        backend.stop(&id).unwrap();
-        backend.start(&id).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        backend.stop(&id).await.unwrap();
+        backend.start(&id).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "running");
     }
 
-    #[test]
-    fn test_start_invalid_state_from_destroyed() {
+    #[tokio::test]
+    async fn test_start_invalid_state_from_destroyed() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.destroy(&id).unwrap();
-        let result = backend.start(&id);
+        let id = backend.create(test_config()).await.unwrap();
+        backend.destroy(&id).await.unwrap();
+        let result = backend.start(&id).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_stop_invalid_state_from_ready() {
+    #[tokio::test]
+    async fn test_stop_invalid_state_from_ready() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        let result = backend.stop(&id);
+        let id = backend.create(test_config()).await.unwrap();
+        let result = backend.stop(&id).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_exec_in_running_state() {
+    #[tokio::test]
+    async fn test_exec_in_running_state() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
         let req = ExecRequest {
             command: vec!["echo".into(), "hello".into()],
             working_dir: None,
             env: vec![],
         };
-        let exec_id = backend.exec(&id, req).unwrap();
+        let exec_id = backend.exec(&id, req).await.unwrap();
         assert!(exec_id.0.starts_with("exec-"));
     }
 
-    #[test]
-    fn test_exec_not_running() {
+    #[tokio::test]
+    async fn test_exec_not_running() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
         let req = ExecRequest {
             command: vec!["echo".into()],
             working_dir: None,
             env: vec![],
         };
-        let result = backend.exec(&id, req);
+        let result = backend.exec(&id, req).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_exec_returns_unique_ids() {
+    #[tokio::test]
+    async fn test_exec_returns_unique_ids() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
         let req1 = ExecRequest {
             command: vec!["a".into()],
             working_dir: None,
@@ -272,13 +272,13 @@ mod tests {
             working_dir: None,
             env: vec![],
         };
-        let eid1 = backend.exec(&id, req1).unwrap();
-        let eid2 = backend.exec(&id, req2).unwrap();
+        let eid1 = backend.exec(&id, req1).await.unwrap();
+        let eid2 = backend.exec(&id, req2).await.unwrap();
         assert_ne!(eid1, eid2);
     }
 
-    #[test]
-    fn test_capabilities_all_false() {
+    #[tokio::test]
+    async fn test_capabilities_all_false() {
         let backend = MockBackend::new();
         assert_eq!(
             backend.capabilities(),
@@ -290,100 +290,100 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_status_not_found() {
+    #[tokio::test]
+    async fn test_status_not_found() {
         let backend = MockBackend::new();
-        let result = backend.status(&SandboxId("bogus".into()));
+        let result = backend.status(&SandboxId("bogus".into())).await;
         assert!(matches!(result, Err(BackendError::NotFound)));
     }
 
-    #[test]
-    fn test_destroy_not_found() {
+    #[tokio::test]
+    async fn test_destroy_not_found() {
         let backend = MockBackend::new();
-        let result = backend.destroy(&SandboxId("bogus".into()));
+        let result = backend.destroy(&SandboxId("bogus".into())).await;
         assert!(matches!(result, Err(BackendError::NotFound)));
     }
 
-    #[test]
-    fn test_stop_not_found() {
+    #[tokio::test]
+    async fn test_stop_not_found() {
         let backend = MockBackend::new();
-        let result = backend.stop(&SandboxId("bogus".into()));
+        let result = backend.stop(&SandboxId("bogus".into())).await;
         assert!(matches!(result, Err(BackendError::NotFound)));
     }
 
-    #[test]
-    fn test_exec_not_found() {
+    #[tokio::test]
+    async fn test_exec_not_found() {
         let backend = MockBackend::new();
         let req = ExecRequest {
             command: vec!["echo".into()],
             working_dir: None,
             env: vec![],
         };
-        let result = backend.exec(&SandboxId("bogus".into()), req);
+        let result = backend.exec(&SandboxId("bogus".into()), req).await;
         assert!(matches!(result, Err(BackendError::NotFound)));
     }
 
-    #[test]
-    fn test_status_sandbox_id_matches() {
+    #[tokio::test]
+    async fn test_status_sandbox_id_matches() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        let status = backend.status(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        let status = backend.status(&id).await.unwrap();
         assert_eq!(status.sandbox_id, id);
     }
 
-    #[test]
-    fn test_double_start() {
+    #[tokio::test]
+    async fn test_double_start() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        let result = backend.start(&id);
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        let result = backend.start(&id).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_double_destroy() {
+    #[tokio::test]
+    async fn test_double_destroy() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.destroy(&id).unwrap();
-        let result = backend.destroy(&id);
+        let id = backend.create(test_config()).await.unwrap();
+        backend.destroy(&id).await.unwrap();
+        let result = backend.destroy(&id).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_stop_from_destroyed() {
+    #[tokio::test]
+    async fn test_stop_from_destroyed() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.destroy(&id).unwrap();
-        let result = backend.stop(&id);
+        let id = backend.create(test_config()).await.unwrap();
+        backend.destroy(&id).await.unwrap();
+        let result = backend.stop(&id).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_exec_from_stopped() {
+    #[tokio::test]
+    async fn test_exec_from_stopped() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.start(&id).unwrap();
-        backend.stop(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+        backend.stop(&id).await.unwrap();
         let req = ExecRequest {
             command: vec!["echo".into()],
             working_dir: None,
             env: vec![],
         };
-        let result = backend.exec(&id, req);
+        let result = backend.exec(&id, req).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 
-    #[test]
-    fn test_exec_from_destroyed() {
+    #[tokio::test]
+    async fn test_exec_from_destroyed() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).unwrap();
-        backend.destroy(&id).unwrap();
+        let id = backend.create(test_config()).await.unwrap();
+        backend.destroy(&id).await.unwrap();
         let req = ExecRequest {
             command: vec!["echo".into()],
             working_dir: None,
             env: vec![],
         };
-        let result = backend.exec(&id, req);
+        let result = backend.exec(&id, req).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
     }
 }

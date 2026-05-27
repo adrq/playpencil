@@ -29,12 +29,13 @@ pub struct Capabilities {
     pub host_mounts: bool,
 }
 
+#[allow(async_fn_in_trait)]
 pub trait SandboxBackend {
-    fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError>;
-    fn start(&self, id: &SandboxId) -> Result<(), BackendError>;
-    fn stop(&self, id: &SandboxId) -> Result<(), BackendError>;
-    fn destroy(&self, id: &SandboxId) -> Result<(), BackendError>;
-    fn status(&self, id: &SandboxId) -> Result<SandboxStatus, BackendError>;
-    fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecId, BackendError>;
+    async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError>;
+    async fn start(&self, id: &SandboxId) -> Result<(), BackendError>;
+    async fn stop(&self, id: &SandboxId) -> Result<(), BackendError>;
+    async fn destroy(&self, id: &SandboxId) -> Result<(), BackendError>;
+    async fn status(&self, id: &SandboxId) -> Result<SandboxStatus, BackendError>;
+    async fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecId, BackendError>;
     fn capabilities(&self) -> Capabilities;
 }

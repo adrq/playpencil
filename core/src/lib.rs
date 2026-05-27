@@ -2,6 +2,8 @@ pub mod backend;
 pub mod krun;
 pub mod lifecycle;
 pub mod net;
+pub mod oci;
+pub mod rootfs;
 pub mod types;
 
 pub fn version() -> &'static str {
