@@ -8,6 +8,8 @@ serde_json = "1"
 krun-sys = "1.10"
 libc = "0.2"
 thiserror = "2"
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+etherparse = "0.16"
 
 [workspace.package]
 version = "0.1.0"
