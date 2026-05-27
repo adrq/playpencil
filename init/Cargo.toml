@@ -10,3 +10,6 @@ name = "playpencil-init"
 path = "src/main.rs"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
