@@ -54,7 +54,7 @@ pub fn get_mac_address(ifname: &str) -> Result<[u8; 6], Error> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     set_ifr_name(&mut ifr, ifname)?;
 
-    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut ifr) };
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as _, &mut ifr) };
     unsafe { libc::close(fd) };
     if ret < 0 {
         return Err(Error::Io(io::Error::last_os_error()));
@@ -82,7 +82,7 @@ pub fn set_interface_up(ifname: &str) -> Result<(), Error> {
     set_ifr_name(&mut ifr, ifname)?;
 
     // Get current flags
-    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) };
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr) };
     if ret < 0 {
         unsafe { libc::close(fd) };
         return Err(Error::Io(io::Error::last_os_error()));
@@ -92,7 +92,7 @@ pub fn set_interface_up(ifname: &str) -> Result<(), Error> {
     unsafe {
         ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
     }
-    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &ifr) };
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &ifr) };
     unsafe { libc::close(fd) };
     if ret < 0 {
         return Err(Error::Io(io::Error::last_os_error()));
@@ -110,7 +110,7 @@ pub fn set_interface_addr(ifname: &str, addr: Ipv4Addr, mask: Ipv4Addr) -> Resul
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     set_ifr_name(&mut ifr, ifname)?;
     set_sockaddr_in(&mut ifr, addr);
-    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFADDR, &ifr) };
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFADDR as _, &ifr) };
     if ret < 0 {
         unsafe { libc::close(fd) };
         return Err(Error::Io(io::Error::last_os_error()));
@@ -120,7 +120,7 @@ pub fn set_interface_addr(ifname: &str, addr: Ipv4Addr, mask: Ipv4Addr) -> Resul
     let mut ifr_mask: libc::ifreq = unsafe { std::mem::zeroed() };
     set_ifr_name(&mut ifr_mask, ifname)?;
     set_sockaddr_in(&mut ifr_mask, mask);
-    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFNETMASK, &ifr_mask) };
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFNETMASK as _, &ifr_mask) };
     unsafe { libc::close(fd) };
     if ret < 0 {
         return Err(Error::Io(io::Error::last_os_error()));
@@ -159,7 +159,7 @@ pub fn add_default_route(gateway: Ipv4Addr) -> Result<(), Error> {
 
     rt.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
 
-    let ret = unsafe { libc::ioctl(fd, libc::SIOCADDRT, &rt) };
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCADDRT as _, &rt) };
     unsafe { libc::close(fd) };
     if ret < 0 {
         return Err(Error::Io(io::Error::last_os_error()));

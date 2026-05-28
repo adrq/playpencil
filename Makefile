@@ -10,9 +10,12 @@ all: build
 
 build:
 	cargo build --release
+	cargo build --release --target x86_64-unknown-linux-musl -p playpencil-init
 	mkdir -p bin
 	cp target/release/playpencil bin/
-	cp target/release/playpencil-init bin/
+	cp target/x86_64-unknown-linux-musl/release/playpencil-init bin/
+	cp target/release/libplaypencil_core.so bin/
+	cp target/release/libplaypencil_core.a bin/
 
 check:
 	cargo check
@@ -28,7 +31,7 @@ test-rust:
 test-vm: all
 	uv run pytest -v -m vm tests
 
-test-ci: check test-rust
+test-ci: all check test-rust
 	uv run pytest -v -m 'not vm' tests
 
 pre-commit:

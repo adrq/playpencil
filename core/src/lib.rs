@@ -1,4 +1,6 @@
 pub mod backend;
+#[cfg(target_os = "linux")]
+pub(crate) mod ffi;
 pub mod krun;
 pub mod lifecycle;
 pub mod net;
