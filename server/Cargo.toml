@@ -7,3 +7,14 @@ description = "Compute isolation layer — cross-platform VM sandbox for running
 
 [dependencies]
 playpencil-core = { path = "../core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

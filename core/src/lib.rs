@@ -7,6 +7,7 @@ pub mod net;
 pub mod oci;
 pub mod rootfs;
 pub mod types;
+pub(crate) mod util;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

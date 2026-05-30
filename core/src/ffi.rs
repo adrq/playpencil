@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::libkrun::{self, LibkrunBackend};
-use crate::backend::{BackendError, SandboxBackend};
+use crate::backend::libkrun::LibkrunBackend;
+use crate::backend::{BackendError, SandboxBackendSend};
 use crate::rootfs::linux::LinuxRootfsProvider;
 use crate::types::{ExecControl, ExecEvent, ExecRequest, SandboxConfig, SandboxId};
 
@@ -123,10 +123,10 @@ impl From<&ExecEvent> for ExecEventDto {
     fn from(event: &ExecEvent) -> Self {
         match event {
             ExecEvent::Stdout(data) => Self::Stdout {
-                data: libkrun::base64_encode(data),
+                data: crate::util::base64_encode(data),
             },
             ExecEvent::Stderr(data) => Self::Stderr {
-                data: libkrun::base64_encode(data),
+                data: crate::util::base64_encode(data),
             },
             ExecEvent::Exit { code } => Self::Exit { code: *code },
         }
@@ -703,7 +703,7 @@ mod tests {
         let json = exec_event_to_json(&event);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "stdout");
-        assert_eq!(v["data"], libkrun::base64_encode(b"hello"));
+        assert_eq!(v["data"], crate::util::base64_encode(b"hello"));
     }
 
     #[test]

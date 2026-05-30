@@ -19,6 +19,8 @@ make pre-commit  # Run pre-commit hooks on staged files
 make clean      # Clean build artifacts
 ```
 
+Always use these `make` targets rather than invoking `cargo` directly: they set up the vendored libkrun build environment (see Prerequisites), without which raw `cargo check` / `cargo test` / `cargo build` cannot locate libkrun and fail.
+
 ## Project Structure
 
 - **core/** — Core library crate (`playpencil-core`: lifecycle, policy, backends, network backend, C ABI)

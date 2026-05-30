@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::lifecycle::SandboxState;
 use crate::types::{ExecHandle, ExecId, ExecRequest, SandboxConfig, SandboxId, SandboxStatus};
 
-use super::{BackendError, Capabilities, SandboxBackend};
+use super::{BackendError, Capabilities, SandboxBackendSend};
 
 struct SandboxEntry {
     state: SandboxState,
@@ -36,7 +36,7 @@ impl Default for MockBackend {
     }
 }
 
-impl SandboxBackend for MockBackend {
+impl SandboxBackendSend for MockBackend {
     async fn create(&self, _config: SandboxConfig) -> Result<SandboxId, BackendError> {
         let id = SandboxId(self.next_id("mock"));
 
@@ -109,6 +109,18 @@ impl SandboxBackend for MockBackend {
             stdin: stdin_tx,
             control: ctrl_tx,
         })
+    }
+
+    async fn list(&self) -> Result<Vec<SandboxStatus>, BackendError> {
+        let map = self.sandboxes.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map
+            .iter()
+            .map(|(id, entry)| SandboxStatus {
+                sandbox_id: id.clone(),
+                state: entry.state.to_string(),
+                created_at: None,
+            })
+            .collect())
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{BackendError, Capabilities, SandboxBackend};
+use crate::backend::{BackendError, Capabilities, SandboxBackendSend};
 use crate::krun::KrunCtx;
 use crate::lifecycle::SandboxState;
 use crate::net::{NetBackendConfig, NetBackendHandle};
@@ -20,6 +20,7 @@ use crate::types::{
     ExecControl, ExecEvent, ExecHandle, ExecId, ExecRequest, MountConfig, NetworkPolicy,
     SandboxConfig, SandboxId, SandboxStatus,
 };
+use crate::util::{base64_decode, base64_encode};
 
 // ---------------------------------------------------------------------------
 // Guest exec protocol (mirrors init/src/proto.rs)
@@ -308,6 +309,7 @@ fn reconstruct_error(err: &BackendError) -> BackendError {
     match err {
         BackendError::InvalidState => BackendError::InvalidState,
         BackendError::NotFound => BackendError::NotFound,
+        BackendError::InvalidInput(msg) => BackendError::InvalidInput(msg.clone()),
         BackendError::Internal(msg) => BackendError::Internal(msg.clone()),
     }
 }
@@ -501,35 +503,42 @@ async fn do_destroy_rootfs(rootfs: PreparedRootfs) {
 /// Validate mount configurations. Called before starting a VM.
 fn validate_mounts(mounts: &[MountConfig]) -> Result<(), BackendError> {
     for (i, m) in mounts.iter().enumerate() {
+        // Reject embedded NUL first: it slips past the Path-based checks below
+        // but would corrupt the guest manifest / truncate at a C boundary.
+        if m.host_path.contains('\0') || m.guest_path.contains('\0') {
+            return Err(BackendError::InvalidInput(format!(
+                "mount[{i}]: paths must not contain NUL"
+            )));
+        }
         let host = Path::new(&m.host_path);
         let guest = Path::new(&m.guest_path);
 
         if !host.is_absolute() {
-            return Err(BackendError::Internal(format!(
+            return Err(BackendError::InvalidInput(format!(
                 "mount[{i}]: host_path '{}' must be absolute",
                 m.host_path
             )));
         }
         if !host.exists() {
-            return Err(BackendError::Internal(format!(
+            return Err(BackendError::InvalidInput(format!(
                 "mount[{i}]: host_path '{}' does not exist",
                 m.host_path
             )));
         }
         if !guest.is_absolute() {
-            return Err(BackendError::Internal(format!(
+            return Err(BackendError::InvalidInput(format!(
                 "mount[{i}]: guest_path '{}' must be absolute",
                 m.guest_path
             )));
         }
         if m.host_path.contains("/../") || m.host_path.ends_with("/..") {
-            return Err(BackendError::Internal(format!(
+            return Err(BackendError::InvalidInput(format!(
                 "mount[{i}]: host_path '{}' contains '..'",
                 m.host_path
             )));
         }
         if m.guest_path.contains("/../") || m.guest_path.ends_with("/..") {
-            return Err(BackendError::Internal(format!(
+            return Err(BackendError::InvalidInput(format!(
                 "mount[{i}]: guest_path '{}' contains '..'",
                 m.guest_path
             )));
@@ -543,10 +552,44 @@ fn validate_mounts(mounts: &[MountConfig]) -> Result<(), BackendError> {
                 guest.starts_with(p)
             }
         }) {
-            return Err(BackendError::Internal(format!(
+            return Err(BackendError::InvalidInput(format!(
                 "mount[{i}]: guest_path '{}' is protected",
                 m.guest_path
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the image reference is well-formed. Done in `create` so a malformed
+/// ref is a caller error (InvalidInput → 4xx) rather than surfacing later as an
+/// internal reconcile failure.
+fn validate_image_ref(image: &str) -> Result<(), BackendError> {
+    let _: ImageReference = image.parse().map_err(|e| {
+        BackendError::InvalidInput(format!("invalid image reference '{image}': {e}"))
+    })?;
+    Ok(())
+}
+
+/// Validate environment entries. Reject NUL (truncates at the C boundary) in
+/// keys/values and '=' in keys (ambiguous KEY=VALUE framing). User input, so
+/// these are InvalidInput, not internal errors.
+fn validate_env(env: &[(String, String)]) -> Result<(), BackendError> {
+    for (k, v) in env {
+        if k.is_empty() {
+            return Err(BackendError::InvalidInput(
+                "env key must not be empty".into(),
+            ));
+        }
+        if k.contains('\0') || v.contains('\0') {
+            return Err(BackendError::InvalidInput(
+                "env keys and values must not contain NUL".into(),
+            ));
+        }
+        if k.contains('=') {
+            return Err(BackendError::InvalidInput(
+                "env key must not contain '='".into(),
+            ));
         }
     }
     Ok(())
@@ -1415,10 +1458,12 @@ impl LibkrunBackend {
     }
 }
 
-impl SandboxBackend for LibkrunBackend {
+impl SandboxBackendSend for LibkrunBackend {
     async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
         let id = self.alloc_sandbox_id();
+        validate_image_ref(&config.image)?;
         validate_mounts(&config.mounts)?;
+        validate_env(&config.env)?;
 
         let (reconcile_tx, reconcile_rx) = mpsc::channel::<ReconcileRequest>(16);
         let (init_tx, init_rx) = oneshot::channel::<Result<(), BackendError>>();
@@ -1853,6 +1898,67 @@ impl SandboxBackend for LibkrunBackend {
         })
     }
 
+    async fn list(&self) -> Result<Vec<SandboxStatus>, BackendError> {
+        // Snapshot ids and (for running sandboxes) liveness senders under the
+        // lock, then release it before awaiting — same pattern as status(), so a
+        // crashed VM is reflected instead of showing a stale Running state.
+        let snapshot: Vec<(SandboxId, Option<mpsc::Sender<LivenessCheck>>)> = {
+            let map = self.sandboxes.lock().await;
+            map.iter()
+                .map(|(id, record)| {
+                    // Skip the liveness check for a pending-destroy record: its
+                    // actual_state is still Running until teardown completes, but
+                    // the reconciler is busy in the destroy step and won't service
+                    // liveness_rx, so awaiting it would block list() behind the
+                    // destroy. The rebuild below reports it as "destroyed" anyway.
+                    let pending_destroy = record
+                        .live
+                        .as_ref()
+                        .is_some_and(|l| l.pending_target == Some(SandboxState::Destroyed));
+                    let tx = if record.actual_state == SandboxState::Running && !pending_destroy {
+                        record.live.as_ref().map(|l| l.liveness_tx.clone())
+                    } else {
+                        None
+                    };
+                    (id.clone(), tx)
+                })
+                .collect()
+        };
+
+        // Trigger liveness checks without holding the lock. Errors (e.g. a
+        // crashed reconciler) are ignored here; the rebuild below reports the
+        // last known state rather than failing the whole list.
+        for (_, tx) in &snapshot {
+            if let Some(tx) = tx {
+                let _ = Self::send_liveness_check(tx.clone()).await;
+            }
+        }
+
+        // Re-lock and rebuild, applying the pending-destroy short-circuit that
+        // status() uses. Sandboxes removed during the await are skipped.
+        let map = self.sandboxes.lock().await;
+        Ok(snapshot
+            .iter()
+            .filter_map(|(id, _)| {
+                let record = map.get(id)?;
+                let state = if record
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| l.pending_target == Some(SandboxState::Destroyed))
+                {
+                    "destroyed".to_string()
+                } else {
+                    record.actual_state.to_string()
+                };
+                Some(SandboxStatus {
+                    sandbox_id: id.clone(),
+                    state,
+                    created_at: Some(record.created_at.clone()),
+                })
+            })
+            .collect())
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             hardware_isolation: true,
@@ -2048,83 +2154,6 @@ fn send_event(sessions: &mut HashMap<String, mpsc::Sender<ExecEvent>>, id: &str,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Base64 helpers (no-dep implementation matching init/src/proto.rs)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((triple >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(triple & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let without_pad = input.trim_end_matches('=');
-    let pad = (4 - without_pad.len() % 4) % 4;
-    if pad > 2 {
-        return None;
-    }
-    fn val(c: char) -> Option<u32> {
-        match c {
-            'A'..='Z' => Some(c as u32 - 'A' as u32),
-            'a'..='z' => Some(c as u32 - 'a' as u32 + 26),
-            '0'..='9' => Some(c as u32 - '0' as u32 + 52),
-            '+' => Some(62),
-            '/' => Some(63),
-            _ => None,
-        }
-    }
-    let chars: Vec<char> = without_pad.chars().collect();
-    let mut out = Vec::with_capacity((chars.len() * 3) / 4 + 1);
-    let mut i = 0;
-    while i < chars.len() {
-        let v0 = val(chars[i])?;
-        let v1 = if i + 1 < chars.len() {
-            val(chars[i + 1])?
-        } else {
-            0
-        };
-        let v2 = if i + 2 < chars.len() {
-            val(chars[i + 2])?
-        } else {
-            0
-        };
-        let v3 = if i + 3 < chars.len() {
-            val(chars[i + 3])?
-        } else {
-            0
-        };
-        let triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
-        out.push(((triple >> 16) & 0xFF) as u8);
-        if i + 2 < chars.len() {
-            out.push(((triple >> 8) & 0xFF) as u8);
-        }
-        if i + 3 < chars.len() {
-            out.push((triple & 0xFF) as u8);
-        }
-        i += 4;
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2159,7 +2188,11 @@ mod tests {
             guest_path: "/mnt".into(),
             read_only: true,
         };
-        assert!(validate_mounts(&[m]).is_err());
+        // User-input failures surface as InvalidInput so the API returns 4xx.
+        assert!(matches!(
+            validate_mounts(&[m]),
+            Err(BackendError::InvalidInput(_))
+        ));
     }
 
     #[test]
@@ -2205,6 +2238,65 @@ mod tests {
             read_only: false,
         };
         assert!(validate_mounts(&[m]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_mounts_rejects_nul() {
+        let m = MountConfig {
+            host_path: "/tmp/a\0b".into(),
+            guest_path: "/mnt".into(),
+            read_only: true,
+        };
+        assert!(matches!(
+            validate_mounts(&[m]),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_image_ref_rejects_malformed() {
+        assert!(matches!(
+            validate_image_ref("::bad::"),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_image_ref_accepts_valid() {
+        assert!(validate_image_ref("alpine:3.19").is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_rejects_nul() {
+        let env = vec![("KEY".to_string(), "va\0lue".to_string())];
+        assert!(matches!(
+            validate_env(&env),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_env_rejects_equals_in_key() {
+        let env = vec![("K=Y".to_string(), "value".to_string())];
+        assert!(matches!(
+            validate_env(&env),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_env_rejects_empty_key() {
+        let env = vec![(String::new(), "value".to_string())];
+        assert!(matches!(
+            validate_env(&env),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_env_accepts_valid() {
+        let env = vec![("KEY".to_string(), "value".to_string())];
+        assert!(validate_env(&env).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -2581,6 +2673,40 @@ mod tests {
         backend.destroy(&id).await.unwrap();
         let status = backend.status(&id).await.unwrap();
         assert_eq!(status.state, "destroyed");
+    }
+
+    // ===== list() does not block on a pending-destroy record =====
+    #[tokio::test]
+    async fn test_list_skips_liveness_for_pending_destroy() {
+        let backend = make_test_backend();
+        let id = backend.alloc_sandbox_id();
+        let (reconcile_tx, _reconcile_rx) = mpsc::channel::<ReconcileRequest>(16);
+        // No task services liveness_rx, so a liveness check would hang forever;
+        // list() must skip it for a pending-destroy record.
+        let (liveness_tx, _liveness_rx) = mpsc::channel::<LivenessCheck>(16);
+        let record = SandboxRecord {
+            actual_state: SandboxState::Running,
+            created_at: rfc3339_now(),
+            config: test_config(),
+            reconciler_panicked: Arc::new(AtomicBool::new(false)),
+            live: Some(LiveState {
+                reconcile_tx,
+                liveness_tx,
+                reconciler_handle: tokio::spawn(async {}),
+                pending_target: Some(SandboxState::Destroyed),
+                console_cmd_tx: None,
+                cancel_token: CancellationToken::new(),
+                vm_alive: Arc::new(AtomicBool::new(true)),
+            }),
+        };
+        backend.sandboxes.lock().await.insert(id.clone(), record);
+
+        let statuses = tokio::time::timeout(std::time::Duration::from_secs(2), backend.list())
+            .await
+            .expect("list() blocked on a pending-destroy record")
+            .unwrap();
+        let entry = statuses.iter().find(|s| s.sandbox_id == id).unwrap();
+        assert_eq!(entry.state, "destroyed");
     }
 
     // ===== waiter gets error on failure =====
