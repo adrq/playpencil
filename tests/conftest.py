@@ -44,6 +44,8 @@ def _load_lib():
     # Sandbox
     lib.pp_sandbox_create.argtypes = [c_void_p, c_char_p]
     lib.pp_sandbox_create.restype = c_void_p
+    lib.pp_sandbox_create_and_start.argtypes = [c_void_p, c_char_p]
+    lib.pp_sandbox_create_and_start.restype = c_void_p
     lib.pp_sandbox_start.argtypes = [c_void_p]
     lib.pp_sandbox_start.restype = c_int
     lib.pp_sandbox_stop.argtypes = [c_void_p]

@@ -200,6 +200,12 @@ pub unsafe extern "C" fn pp_runtime_new(config_json: *const c_char) -> *mut PpRu
             }
         };
 
+        // Reconstruct persisted sandboxes before serving.
+        if let Err(e) = tokio_rt.block_on(backend.recover()) {
+            set_last_error(&backend_err(&e));
+            return std::ptr::null_mut();
+        }
+
         let rt = PpRuntime {
             inner: Arc::new(RuntimeInner { backend, tokio_rt }),
         };
@@ -259,6 +265,61 @@ pub unsafe extern "C" fn pp_sandbox_create(
 
         let inner = Arc::clone(&rt.inner);
         let id = match inner.tokio_rt.block_on(inner.backend.create(config)) {
+            Ok(id) => id,
+            Err(e) => {
+                set_last_error(&backend_err(&e));
+                return std::ptr::null_mut();
+            }
+        };
+
+        Box::into_raw(Box::new(PpSandbox { id, inner }))
+    })
+}
+
+/// # Safety
+/// `rt` must be a valid PpRuntime pointer. `config_json` must be a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pp_sandbox_create_and_start(
+    rt: *mut PpRuntime,
+    config_json: *const c_char,
+) -> *mut PpSandbox {
+    clear_last_error();
+    ffi_catch!(std::ptr::null_mut(), {
+        if rt.is_null() {
+            set_last_error("runtime handle is NULL");
+            return std::ptr::null_mut();
+        }
+        if in_async_context() {
+            return std::ptr::null_mut();
+        }
+        let rt = unsafe { &*rt };
+
+        let json_str = if config_json.is_null() {
+            set_last_error("config_json is NULL");
+            return std::ptr::null_mut();
+        } else {
+            match unsafe { CStr::from_ptr(config_json) }.to_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    set_last_error("config_json is not valid UTF-8");
+                    return std::ptr::null_mut();
+                }
+            }
+        };
+
+        let config: SandboxConfig = match serde_json::from_str(json_str) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(&format!("invalid sandbox config JSON: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let inner = Arc::clone(&rt.inner);
+        let id = match inner
+            .tokio_rt
+            .block_on(inner.backend.create_and_start(config))
+        {
             Ok(id) => id,
             Err(e) => {
                 set_last_error(&backend_err(&e));
@@ -357,7 +418,7 @@ pub unsafe extern "C" fn pp_sandbox_status(sb: *mut PpSandbox) -> *mut c_char {
         }
         let sb = unsafe { &*sb };
         match sb.inner.tokio_rt.block_on(sb.inner.backend.status(&sb.id)) {
-            Ok(status) => match serde_json::to_string(&status) {
+            Ok(view) => match serde_json::to_string(&view.status) {
                 Ok(json) => string_to_c(json),
                 Err(e) => {
                     set_last_error(&format!("failed to serialize status: {e}"));
@@ -653,6 +714,7 @@ mod tests {
             "pp_runtime_new",
             "pp_runtime_free",
             "pp_sandbox_create",
+            "pp_sandbox_create_and_start",
             "pp_sandbox_start",
             "pp_sandbox_stop",
             "pp_sandbox_destroy",

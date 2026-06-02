@@ -1,7 +1,8 @@
 pub mod libkrun;
 pub mod mock;
+pub mod reconciler;
 
-use crate::types::{ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus};
+use crate::types::{ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus, SandboxView};
 use std::fmt;
 
 #[derive(Debug)]
@@ -34,26 +35,32 @@ pub struct Capabilities {
     pub host_mounts: bool,
 }
 
+/// Accepted-not-converged lifecycle backend.
+///
+/// `create`/`start`/`stop`/`destroy` return once the new intent is durably
+/// persisted (accepted), NOT once the sandbox converges. Provision and start
+/// failures surface asynchronously as `state == Failed` via `status`, never as
+/// a return error. A destroyed sandbox's record is retained (reported as
+/// `Destroyed`) until pruned, so `status` returns `NotFound` only for sandboxes
+/// that never existed.
 #[trait_variant::make(SandboxBackendSend: Send)]
 pub trait SandboxBackend {
+    /// Genesis with `desired = Stopped`; returns once the genesis record is
+    /// durably persisted.
     async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError>;
+    /// Genesis with `desired = Running` (durable run-intent before provisioning).
+    async fn create_and_start(&self, config: SandboxConfig) -> Result<SandboxId, BackendError>;
     async fn start(&self, id: &SandboxId) -> Result<(), BackendError>;
     async fn stop(&self, id: &SandboxId) -> Result<(), BackendError>;
-    /// Tear down the sandbox, transitioning it to the terminal Destroyed state.
-    ///
-    /// Implementations retain the destroyed sandbox in this terminal state
-    /// (subject to later pruning) rather than dropping the record immediately,
-    /// so a subsequent `status` call reports it as Destroyed rather than
-    /// `NotFound`. Callers must not rely on `status` returning `NotFound`
-    /// right after a successful `destroy`.
     async fn destroy(&self, id: &SandboxId) -> Result<(), BackendError>;
-    /// Report the current status of a sandbox.
-    ///
-    /// After a successful `destroy`, this continues to report the sandbox in
-    /// the terminal Destroyed state until the record is pruned; it returns
-    /// `NotFound` only for sandboxes that never existed or were pruned.
-    async fn status(&self, id: &SandboxId) -> Result<SandboxStatus, BackendError>;
+    /// Snapshot of the sandbox's status and persisted config.
+    async fn status(&self, id: &SandboxId) -> Result<SandboxView, BackendError>;
     async fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecHandle, BackendError>;
-    async fn list(&self) -> Result<Vec<SandboxStatus>, BackendError>;
+    async fn list(&self) -> Result<Vec<SandboxView>, BackendError>;
+    /// Subscribe to committed `state` transitions for one sandbox.
+    fn subscribe(
+        &self,
+        id: &SandboxId,
+    ) -> Result<tokio::sync::broadcast::Receiver<SandboxStatus>, BackendError>;
     fn capabilities(&self) -> Capabilities;
 }

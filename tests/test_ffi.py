@@ -4,10 +4,25 @@ import base64
 import ctypes
 import json
 import tempfile
+import time
 
 import pytest
 
 from conftest import REPO_ROOT, get_last_error, read_pp_string
+
+
+def _wait_state(pplib, sb, want, timeout=90):
+    """Poll pp_sandbox_status until `state` equals `want` (accepted-not-converged)."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        status_json = read_pp_string(pplib, pplib.pp_sandbox_status(sb))
+        assert status_json is not None, f"status failed: {get_last_error(pplib)}"
+        last = json.loads(status_json)["state"]
+        if last == want:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"sandbox did not reach {want!r}; last was {last!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -138,22 +153,35 @@ def test_ffi_lifecycle(pplib, ffi_runtime):
     sb = pplib.pp_sandbox_create(ffi_runtime, _sandbox_config())
     assert sb is not None, f"create failed: {get_last_error(pplib)}"
 
-    assert pplib.pp_sandbox_start(sb) == 0
+    # create provisions toward the stopped state.
+    _wait_state(pplib, sb, "stopped")
 
-    status_json = read_pp_string(pplib, pplib.pp_sandbox_status(sb))
-    assert status_json is not None
-    status = json.loads(status_json)
-    assert status["state"] == "running"
+    # start/stop/destroy are accepted, then reconcile asynchronously.
+    assert pplib.pp_sandbox_start(sb) == 0
+    _wait_state(pplib, sb, "running")
 
     assert pplib.pp_sandbox_stop(sb) == 0
+    _wait_state(pplib, sb, "stopped")
+
     assert pplib.pp_sandbox_destroy(sb) == 0
+    _wait_state(pplib, sb, "destroyed")
+    pplib.pp_sandbox_free(sb)
+
+
+@pytest.mark.vm
+def test_ffi_create_and_start(pplib, ffi_runtime):
+    sb = pplib.pp_sandbox_create_and_start(ffi_runtime, _sandbox_config())
+    assert sb is not None, f"create_and_start failed: {get_last_error(pplib)}"
+    _wait_state(pplib, sb, "running")
+    assert pplib.pp_sandbox_destroy(sb) == 0
+    _wait_state(pplib, sb, "destroyed")
     pplib.pp_sandbox_free(sb)
 
 
 @pytest.mark.vm
 def test_ffi_exec_echo(pplib, ffi_runtime):
-    sb = pplib.pp_sandbox_create(ffi_runtime, _sandbox_config())
-    assert pplib.pp_sandbox_start(sb) == 0
+    sb = pplib.pp_sandbox_create_and_start(ffi_runtime, _sandbox_config())
+    _wait_state(pplib, sb, "running")
 
     cmd = json.dumps({"command": ["echo", "hello"], "env": []}).encode("utf-8")
     exec_h = pplib.pp_sandbox_exec(sb, cmd)
@@ -178,14 +206,15 @@ def test_ffi_exec_echo(pplib, ffi_runtime):
 
     pplib.pp_exec_free(exec_h)
     pplib.pp_sandbox_destroy(sb)
+    _wait_state(pplib, sb, "destroyed")
     pplib.pp_sandbox_free(sb)
 
 
 @pytest.mark.vm
 def test_ffi_write_stdin_null_data(pplib, ffi_runtime):
     """pp_exec_write_stdin with NULL data and nonzero len returns -1."""
-    sb = pplib.pp_sandbox_create(ffi_runtime, _sandbox_config())
-    assert pplib.pp_sandbox_start(sb) == 0
+    sb = pplib.pp_sandbox_create_and_start(ffi_runtime, _sandbox_config())
+    _wait_state(pplib, sb, "running")
 
     cmd = json.dumps({"command": ["cat"], "env": []}).encode("utf-8")
     exec_h = pplib.pp_sandbox_exec(sb, cmd)
@@ -196,4 +225,40 @@ def test_ffi_write_stdin_null_data(pplib, ffi_runtime):
 
     pplib.pp_exec_free(exec_h)
     pplib.pp_sandbox_destroy(sb)
+    _wait_state(pplib, sb, "destroyed")
+    pplib.pp_sandbox_free(sb)
+
+
+@pytest.mark.vm
+def test_ffi_write_stdin_after_destroy_fails(pplib, ffi_runtime):
+    """Destroying a sandbox closes its exec channels: a later stdin write fails.
+
+    Guards the C-ABI contract that teardown closes exec channels (a post-destroy
+    pp_exec_write_stdin must not silently succeed into a gone guest console).
+    """
+    sb = pplib.pp_sandbox_create_and_start(ffi_runtime, _sandbox_config())
+    _wait_state(pplib, sb, "running")
+
+    cmd = json.dumps({"command": ["cat"], "env": []}).encode("utf-8")
+    exec_h = pplib.pp_sandbox_exec(sb, cmd)
+    assert exec_h is not None, f"exec failed: {get_last_error(pplib)}"
+
+    data = b"hello\n"
+    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+    # While the VM is running, the write is accepted.
+    assert pplib.pp_exec_write_stdin(exec_h, buf, len(data)) == 0
+
+    # Destroy the sandbox; its exec channels must close. Teardown aborts and
+    # awaits the relay tasks before completing, so by the time the sandbox is
+    # observed destroyed the stdin channel is already closed.
+    assert pplib.pp_sandbox_destroy(sb) == 0
+    _wait_state(pplib, sb, "destroyed")
+
+    # The FIRST write after destroy fails synchronously: the relay receiver is
+    # dropped (channel closed) by teardown, so no polling/retry is needed.
+    assert pplib.pp_exec_write_stdin(exec_h, buf, len(data)) == -1, (
+        "stdin write after destroy must fail synchronously"
+    )
+
+    pplib.pp_exec_free(exec_h)
     pplib.pp_sandbox_free(sb)

@@ -76,36 +76,55 @@ PpRuntime *pp_runtime_new(const char *config_json);
 /* Free the runtime handle. NULL is a no-op. */
 void pp_runtime_free(PpRuntime *handle);
 
-/* ---- Sandbox ---- */
+/* ---- Sandbox ---- *
+ *
+ * Lifecycle operations are ACCEPTED, not CONVERGED. create/start/stop/destroy
+ * return once the new intent is durably persisted; the sandbox then reconciles
+ * toward it asynchronously. Provision/start failures surface later as the
+ * "failed" state via pp_sandbox_status, never as a return error. Poll
+ * pp_sandbox_status to observe convergence.
+ */
 
 /*
- * Create a sandbox. config_json is a UTF-8 JSON matching SandboxConfig.
- * Returns NULL on failure.
+ * Create a sandbox (intent: stopped — provisioned but not started).
+ * config_json is a UTF-8 JSON matching SandboxConfig. Returns NULL on failure.
  */
 PpSandbox *pp_sandbox_create(PpRuntime *rt, const char *config_json);
 
-/* Start the sandbox VM. Returns 0 on success, -1 on error. */
+/*
+ * Create a sandbox and set intent to running in one durable step.
+ * config_json is a UTF-8 JSON matching SandboxConfig. Returns NULL on failure.
+ */
+PpSandbox *pp_sandbox_create_and_start(PpRuntime *rt, const char *config_json);
+
+/* Set intent to running (accepted). Returns 0 on success, -1 on error. */
 int pp_sandbox_start(PpSandbox *sb);
 
-/* Stop the sandbox VM. Returns 0 on success, -1 on error. */
+/* Set intent to stopped (accepted). Returns 0 on success, -1 on error. */
 int pp_sandbox_stop(PpSandbox *sb);
 
-/* Destroy the sandbox and release backend resources (async teardown).
- * Separate from pp_sandbox_free because destroy involves async backend
- * cleanup (stopping the VM, unmounting rootfs) while free only reclaims
- * the handle's heap allocation. */
+/* Set intent to destroyed (accepted). Returns 0 on success, -1 on error.
+ * Returns after the destroy intent is durable, NOT after teardown completes.
+ * Freeing the last runtime/sandbox handle can stop the reconciler before
+ * teardown finishes; a caller that needs teardown DONE before free/exit must
+ * keep the runtime alive and poll pp_sandbox_status until state is "destroyed"
+ * before pp_sandbox_free / pp_runtime_free. */
 int pp_sandbox_destroy(PpSandbox *sb);
 
 /*
- * Get sandbox status as a JSON string.
+ * Get sandbox status as a JSON string with fields:
+ *   {"sandbox_id", "state", "desired", "generation", "observed_generation",
+ *    "reason", "message", "created_at", "last_transition_at"}
+ * "state" is null at genesis; a transition is in progress while
+ * observed_generation < generation.
  * Caller must free with pp_string_free(). Returns NULL on error.
  */
 char *pp_sandbox_status(PpSandbox *sb);
 
 /*
  * Free the sandbox handle (heap reclamation only). Does NOT destroy
- * the sandbox — call pp_sandbox_destroy first to avoid leaking
- * backend resources. NULL is a no-op.
+ * the sandbox — call pp_sandbox_destroy first (and poll to "destroyed") to
+ * avoid leaking backend resources. NULL is a no-op.
  */
 void pp_sandbox_free(PpSandbox *handle);
 

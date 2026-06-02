@@ -1,3 +1,4 @@
+mod adapter;
 mod api_types;
 mod error;
 mod handlers;

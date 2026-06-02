@@ -57,7 +57,10 @@ fn run_serve(port: u16, bind: String, data_dir: PathBuf) -> anyhow::Result<()> {
         )
         .init();
 
-    std::fs::create_dir_all(&data_dir)?;
+    // The state file under data_dir embeds env values that often hold
+    // credentials, so a data dir we create is owner-only and crash-durable.
+    // An existing dir's mode is left untouched.
+    playpencil_core::store::ensure_secure_dir(&data_dir)?;
 
     let exe = std::env::current_exe()?;
     let exe_dir = exe
@@ -85,7 +88,15 @@ fn run_serve(port: u16, bind: String, data_dir: PathBuf) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(playpencil_server::run_server(config, backend))?;
+        .block_on(async move {
+            backend
+                .recover()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to recover persisted sandboxes: {e}"))?;
+            playpencil_server::run_server(config, backend)
+                .await
+                .map_err(anyhow::Error::from)
+        })?;
 
     Ok(())
 }

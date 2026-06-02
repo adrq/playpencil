@@ -39,10 +39,6 @@ pub(crate) struct ErrorResponse {
 pub(crate) enum ApiError {
     Backend(BackendError),
     Validation(String),
-    StartFailed {
-        sandbox_id: String,
-        source: BackendError,
-    },
     StatusQueryFailed {
         sandbox_id: String,
         source: BackendError,
@@ -81,12 +77,6 @@ impl IntoResponse for ApiError {
                 "validation_error",
                 Some(msg),
                 None,
-            ),
-            Self::StartFailed { sandbox_id, source } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "start_failed",
-                Some(source.to_string()),
-                Some(sandbox_id),
             ),
             Self::StatusQueryFailed { sandbox_id, source } => (
                 StatusCode::INTERNAL_SERVER_ERROR,

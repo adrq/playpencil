@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::{DesiredState, FailureReason, State};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxId(pub String);
 
@@ -37,11 +39,29 @@ pub struct SandboxConfig {
     pub env: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Native sandbox status. The wire projection lives in the server adapter; this
+/// carries the raw lifecycle fields (never wire strings).
+#[derive(Clone, Debug, Serialize)]
 pub struct SandboxStatus {
     pub sandbox_id: SandboxId,
-    pub state: String,
+    /// `None` is genesis.
+    pub state: Option<State>,
+    pub desired: DesiredState,
+    pub generation: u64,
+    /// `observed_generation < generation` means a transition is in progress.
+    pub observed_generation: u64,
+    pub reason: Option<FailureReason>,
+    pub message: Option<String>,
     pub created_at: Option<String>,
+    pub last_transition_at: Option<String>,
+}
+
+/// A status snapshot paired with the persisted config, so readers can build a
+/// full response without a separate config store.
+#[derive(Clone, Debug, Serialize)]
+pub struct SandboxView {
+    pub status: SandboxStatus,
+    pub config: SandboxConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

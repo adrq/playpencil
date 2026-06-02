@@ -6,6 +6,7 @@ use std::process::Command;
 use super::{PreparedRootfs, RootfsCleanup, RootfsConfig, RootfsError, RootfsProvider};
 
 const INIT_GUEST_PATH: &str = "usr/local/bin/playpencil-init";
+const ROOTFS_MERGED_DIR: &str = "merged";
 
 pub struct LinuxRootfsProvider;
 
@@ -51,7 +52,7 @@ impl RootfsProvider for LinuxRootfsProvider {
     fn prepare(&self, config: &RootfsConfig) -> Result<PreparedRootfs, RootfsError> {
         validate_sandbox_id(&config.sandbox_id)?;
         let sandbox_dir = config.session_dir.join(&config.sandbox_id);
-        let merged = sandbox_dir.join("merged");
+        let merged = sandbox_dir.join(ROOTFS_MERGED_DIR);
         let mut guard = SandboxGuard::new(sandbox_dir.clone());
 
         if self.fuse_overlayfs_available() {
@@ -132,6 +133,26 @@ impl RootfsProvider for LinuxRootfsProvider {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+
+    fn clear_session_dir(&self, sessions_root: &Path, sandbox_id: &str) -> Result<(), RootfsError> {
+        clear_session_dir(sessions_root, sandbox_id)
+    }
+
+    fn fuse_rootfs_unmounted(
+        &self,
+        sessions_root: &Path,
+        sandbox_id: &str,
+    ) -> Result<bool, RootfsError> {
+        fuse_rootfs_unmounted(sessions_root, sandbox_id)
+    }
+
+    fn session_rootfs_path(
+        &self,
+        sessions_root: &Path,
+        sandbox_id: &str,
+    ) -> Result<PathBuf, RootfsError> {
+        session_rootfs_path(sessions_root, sandbox_id)
+    }
 }
 
 fn validate_sandbox_id(id: &str) -> Result<(), RootfsError> {
@@ -201,9 +222,191 @@ fn inject_init(rootfs: &Path, init_binary: &Path) -> Result<(), RootfsError> {
     Ok(())
 }
 
+/// The canonical prepared-rootfs root for a sandbox: `session_root/<validated
+/// id>/<merged>`. Lets callers reconstruct the deletion/boot path from the
+/// validated id alone, never a trusted stored path.
+pub fn session_rootfs_path(session_root: &Path, sandbox_id: &str) -> Result<PathBuf, RootfsError> {
+    validate_sandbox_id(sandbox_id)?;
+    Ok(session_root.join(sandbox_id).join(ROOTFS_MERGED_DIR))
+}
+
+/// Remove any partial per-sandbox session directory left by a crashed or
+/// cancelled provision before a fresh prepare reuses the path. `session_root`
+/// is the directory prepare() joins the sandbox id onto. Bounded to
+/// `session_root/<validated id>` and idempotent (no-op when absent).
+pub fn clear_session_dir(session_root: &Path, sandbox_id: &str) -> Result<(), RootfsError> {
+    validate_sandbox_id(sandbox_id)?;
+    let sandbox_dir = session_root.join(sandbox_id);
+    // A crashed overlay provision may leave a live mount at the merged root;
+    // cleanup_session_dir unmounts it (if mounted) then removes the sandbox dir.
+    cleanup_session_dir(&sandbox_dir.join(ROOTFS_MERGED_DIR))
+}
+
+/// Tear down a sandbox session directory given its prepared rootfs path. If the
+/// rootfs is still a mount point (e.g. a fuse-overlayfs mount that outlived its
+/// daemon), it is unmounted first; an already-unmounted rootfs is left alone.
+/// The enclosing session directory (the rootfs path's parent) is then removed
+/// with a bounded retry to absorb transient EBUSY. Idempotent: a missing
+/// directory is success.
+pub fn cleanup_session_dir(rootfs_path: &Path) -> Result<(), RootfsError> {
+    if is_mount_point(rootfs_path) {
+        let status = Command::new("fusermount")
+            .args(["-u", &rootfs_path.to_string_lossy()])
+            .status()
+            .map_err(|e| RootfsError::Cleanup(format!("fusermount: {e}")))?;
+        if !status.success() {
+            return Err(RootfsError::Cleanup(format!(
+                "fusermount -u exited with {status}"
+            )));
+        }
+    }
+    let session_dir = rootfs_path.parent().unwrap_or(rootfs_path);
+    remove_dir_all_retry(session_dir)
+}
+
+/// Decode the octal escapes the kernel writes into mountinfo path fields
+/// (space=\\040, tab=\\011, newline=\\012, backslash=\\134). A backslash
+/// not followed by three octal digits is left verbatim.
+fn unescape_mountinfo(field: &str) -> String {
+    let b = field.as_bytes();
+    let is_oct = |c: u8| (b'0'..=b'7').contains(&c);
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && is_oct(b[i + 1])
+            && is_oct(b[i + 2])
+            && is_oct(b[i + 3])
+        {
+            let val = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// True if `path` resolves to a current mount point per /proc/self/mountinfo.
+fn is_mount_point(path: &Path) -> bool {
+    let Ok(target) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // Each line's 5th whitespace-separated field is the (octal-escaped) mount point.
+    mountinfo.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .map(|mp| Path::new(&unescape_mountinfo(mp)) == target)
+            .unwrap_or(false)
+    })
+}
+
+/// True if a fuse-overlay-mode sandbox rootfs persists on disk but is no longer
+/// mounted (e.g. a fuse-overlay mount torn down by a host reboot). Overlay mode
+/// is detected by the sibling `upper` dir; such a rootfs must not be booted (it
+/// would be empty) nor reprovisioned (that discards `upper`). Copy-mode rootfs
+/// (no `upper` sibling) is always usable and returns false. Derived from and
+/// bounded to `session_root/<validated id>`.
+pub fn fuse_rootfs_unmounted(session_root: &Path, sandbox_id: &str) -> Result<bool, RootfsError> {
+    validate_sandbox_id(sandbox_id)?;
+    let sandbox_dir = session_root.join(sandbox_id);
+    let fuse_mode = sandbox_dir.join("upper").is_dir();
+    Ok(fuse_mode && !is_mount_point(&sandbox_dir.join(ROOTFS_MERGED_DIR)))
+}
+
+/// Remove a directory tree, retrying briefly on transient errors (e.g. EBUSY
+/// just after an unmount). A missing directory is treated as success.
+fn remove_dir_all_retry(dir: &Path) -> Result<(), RootfsError> {
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+            }
+        }
+    }
+    Err(RootfsError::Cleanup(format!(
+        "remove {}: {}",
+        dir.display(),
+        last_err.expect("loop ran at least once")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_session_dir_removes_stale_and_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let sandbox_dir = sessions.join("sb-7");
+        fs::create_dir_all(sandbox_dir.join("merged/etc")).unwrap();
+        fs::write(sandbox_dir.join("merged/etc/junk"), b"stale").unwrap();
+
+        clear_session_dir(&sessions, "sb-7").unwrap();
+        assert!(!sandbox_dir.exists());
+
+        // Idempotent when nothing is present.
+        clear_session_dir(&sessions, "sb-7").unwrap();
+
+        // Bounded: a traversing id is rejected, not cleared.
+        assert!(clear_session_dir(&sessions, "../escape").is_err());
+    }
+
+    #[test]
+    fn unescape_mountinfo_decodes_octal_escapes() {
+        assert_eq!(unescape_mountinfo(r"/tmp/has\040space"), "/tmp/has space");
+        assert_eq!(unescape_mountinfo(r"/a\011b"), "/a\tb");
+        assert_eq!(unescape_mountinfo(r"/a\012b"), "/a\nb");
+        assert_eq!(unescape_mountinfo(r"/a\134b"), r"/a\b");
+        // Passthrough and non-octal escapes stay verbatim.
+        assert_eq!(unescape_mountinfo("/plain/path"), "/plain/path");
+        assert_eq!(unescape_mountinfo(r"/a\09b"), r"/a\09b");
+        assert_eq!(unescape_mountinfo(r"/a\b"), r"/a\b");
+    }
+
+    #[test]
+    fn cleanup_session_dir_handles_spaced_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox_dir = tmp.path().join("has space").join("sb-1");
+        let merged = sandbox_dir.join("merged");
+        fs::create_dir_all(merged.join("etc")).unwrap();
+        // Not mounted: the spaced canonical path matches no mountinfo line and
+        // removal of the parent session dir proceeds.
+        cleanup_session_dir(&merged).unwrap();
+        assert!(!sandbox_dir.exists());
+    }
+
+    #[test]
+    fn fuse_rootfs_unmounted_detects_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+
+        // Absent session dir -> not fuse-mode -> false.
+        assert!(!fuse_rootfs_unmounted(&sessions, "sb-1").unwrap());
+
+        // Copy-mode: merged exists, no upper sibling -> usable.
+        let sandbox_dir = sessions.join("sb-1");
+        fs::create_dir_all(sandbox_dir.join("merged")).unwrap();
+        assert!(!fuse_rootfs_unmounted(&sessions, "sb-1").unwrap());
+
+        // Overlay-mode: upper sibling exists, merged not mounted -> unmounted.
+        fs::create_dir_all(sandbox_dir.join("upper")).unwrap();
+        assert!(fuse_rootfs_unmounted(&sessions, "sb-1").unwrap());
+
+        // Bounded: a traversing id is rejected.
+        assert!(fuse_rootfs_unmounted(&sessions, "../escape").is_err());
+    }
 
     #[test]
     fn inject_init_creates_binary() {

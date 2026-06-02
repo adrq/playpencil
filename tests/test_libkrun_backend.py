@@ -145,8 +145,21 @@ class SandboxClient:
                 "env": {},
             },
         )
-        assert status == 201, f"create failed: {status} {body}"
+        assert status == 202, f"create failed: {status} {body}"
         return body["id"]
+
+    def wait_state(self, sandbox_id, wanted, timeout=90):
+        """Poll GET until the sandbox reaches `wanted` (accepted-not-converged)."""
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = self.status(sandbox_id)["status"]["state"]
+            if last == wanted:
+                return
+            time.sleep(0.2)
+        raise AssertionError(
+            f"sandbox {sandbox_id} did not reach {wanted}; last was {last}"
+        )
 
     def start(self, sandbox_id):
         status, body = self._request("POST", f"/v1x/sandboxes/{sandbox_id}/start")
@@ -170,28 +183,25 @@ class SandboxClient:
 def running_sandbox(server):
     """Create a sandbox (auto-started by create), yield its ID, then destroy."""
     sid = server.create()
+    server.wait_state(sid, "Running")
     yield sid
     server.destroy(sid)
 
 
 def test_vm_lifecycle(server):
-    """Create (auto-starts → running) → stop → destroy.
+    """Create (accepted, reconciles to running) → stop → destroy.
 
-    The HTTP lifecycle is synchronous: start() blocks until the reconciler
-    converges to Running and the record stays Running until a later transition,
-    so a separate GET deterministically reports the new state. No polling needed.
+    Lifecycle calls are accepted-not-converged, so each transition is observed
+    by polling GET until the sandbox reaches the expected state.
     """
     sid = server.create()
-    st = server.status(sid)
-    assert st["status"]["state"] == "Running"
+    server.wait_state(sid, "Running")
 
     server.stop(sid)
-    st = server.status(sid)
-    assert st["status"]["state"] == "Stopped"
+    server.wait_state(sid, "Stopped")
 
     server.destroy(sid)
-    st = server.status(sid)
-    assert st["status"]["state"] == "Terminated"
+    server.wait_state(sid, "Terminated")
 
 
 def test_vm_create_unique_ids(server):
@@ -219,6 +229,7 @@ def test_destroy_nonexistent_sandbox(server):
 def test_list_sandboxes(server):
     sid = server.create()
     try:
+        server.wait_state(sid, "Running")
         status, body = server._request("GET", "/v1/sandboxes")
         assert status == 200
         ids = [s["id"] for s in body["items"]]
@@ -232,6 +243,7 @@ def test_list_sandboxes(server):
 def test_list_filter_by_state(server):
     sid = server.create()
     try:
+        server.wait_state(sid, "Running")
         status, body = server._request("GET", "/v1/sandboxes?state=Terminated")
         assert status == 200
         ids = [s["id"] for s in body["items"]]

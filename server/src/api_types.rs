@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use playpencil_core::types::NetworkPolicy;
+use crate::adapter::NetworkPolicyWire;
 
 #[derive(Deserialize)]
 pub(crate) struct CreateSandboxRequest {
@@ -42,47 +42,6 @@ pub(crate) struct MountConfigWire {
     pub read_only: bool,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-#[serde(untagged)]
-pub(crate) enum NetworkPolicyWire {
-    Allowlist { allowlist: AllowlistConfig },
-    Simple(String),
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-pub(crate) struct AllowlistConfig {
-    pub allowed_domains: Vec<String>,
-}
-
-impl TryFrom<NetworkPolicyWire> for NetworkPolicy {
-    type Error = String;
-
-    fn try_from(wire: NetworkPolicyWire) -> Result<Self, Self::Error> {
-        match wire {
-            NetworkPolicyWire::Simple(s) if s == "isolated" => Ok(NetworkPolicy::Isolated),
-            NetworkPolicyWire::Simple(s) if s == "unrestricted" => Ok(NetworkPolicy::Unrestricted),
-            NetworkPolicyWire::Simple(s) => Err(format!("unknown network policy: {s}")),
-            NetworkPolicyWire::Allowlist { allowlist } => Ok(NetworkPolicy::Allowlist {
-                allowed_domains: allowlist.allowed_domains,
-            }),
-        }
-    }
-}
-
-impl From<&NetworkPolicy> for NetworkPolicyWire {
-    fn from(np: &NetworkPolicy) -> Self {
-        match np {
-            NetworkPolicy::Isolated => NetworkPolicyWire::Simple("isolated".into()),
-            NetworkPolicy::Unrestricted => NetworkPolicyWire::Simple("unrestricted".into()),
-            NetworkPolicy::Allowlist { allowed_domains } => NetworkPolicyWire::Allowlist {
-                allowlist: AllowlistConfig {
-                    allowed_domains: allowed_domains.clone(),
-                },
-            },
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub(crate) struct SandboxResponse {
     pub id: String,
@@ -105,6 +64,8 @@ pub(crate) struct StatusWire {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(rename = "lastTransitionAt", skip_serializing_if = "Option::is_none")]
+    pub last_transition_at: Option<String>,
 }
 
 #[derive(Serialize)]

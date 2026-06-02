@@ -6,6 +6,7 @@ pub mod lifecycle;
 pub mod net;
 pub mod oci;
 pub mod rootfs;
+pub mod store;
 pub mod types;
 pub(crate) mod util;
 
