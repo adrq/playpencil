@@ -211,6 +211,47 @@ def test_ffi_exec_echo(pplib, ffi_runtime):
 
 
 @pytest.mark.vm
+def test_ffi_exec_after_fork_keepalive(pplib, ffi_runtime):
+    """A VM must still be genuinely executable past the fork keep-alive window of 10s"""
+    sb = pplib.pp_sandbox_create_and_start(ffi_runtime, _sandbox_config())
+    assert sb is not None, f"create_and_start failed: {get_last_error(pplib)}"
+    _wait_state(pplib, sb, "running")
+
+    time.sleep(15)
+
+    # Sandbox record still reports running, AND a real exec round-trips.
+    status = json.loads(read_pp_string(pplib, pplib.pp_sandbox_status(sb)))
+    assert status["state"] == "running", (
+        f"VM did not survive the fork keep-alive window; state is {status['state']}"
+    )
+
+    cmd = json.dumps({"command": ["echo", "alive"], "env": []}).encode("utf-8")
+    exec_h = pplib.pp_sandbox_exec(sb, cmd)
+    assert exec_h is not None, f"exec failed (VM not alive?): {get_last_error(pplib)}"
+
+    stdout_bytes = b""
+    got_exit = False
+    while True:
+        event_ptr = pplib.pp_exec_next_event(exec_h)
+        if event_ptr is None:
+            break
+        event = json.loads(read_pp_string(pplib, event_ptr))
+        if event["type"] == "stdout":
+            stdout_bytes += base64.b64decode(event["data"])
+        elif event["type"] == "exit":
+            assert event["code"] == 0
+            got_exit = True
+
+    assert b"alive" in stdout_bytes
+    assert got_exit
+
+    pplib.pp_exec_free(exec_h)
+    pplib.pp_sandbox_destroy(sb)
+    _wait_state(pplib, sb, "destroyed")
+    pplib.pp_sandbox_free(sb)
+
+
+@pytest.mark.vm
 def test_ffi_write_stdin_null_data(pplib, ffi_runtime):
     """pp_exec_write_stdin with NULL data and nonzero len returns -1."""
     sb = pplib.pp_sandbox_create_and_start(ffi_runtime, _sandbox_config())

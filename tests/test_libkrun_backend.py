@@ -204,6 +204,21 @@ def test_vm_lifecycle(server):
     server.wait_state(sid, "Terminated")
 
 
+def test_vm_survives_past_fork_keepalive(server):
+    """A running VM must outlive the fork thread's idle keep-alive window of 10s"""
+    sid = server.create()
+    server.wait_state(sid, "Running")
+    try:
+        time.sleep(15)
+        state = server.status(sid)["status"]["state"]
+        assert state == "Running", (
+            f"VM did not survive past the fork keep-alive window; "
+            f"state is {state} (expected Running)"
+        )
+    finally:
+        server.destroy(sid)
+
+
 def test_vm_create_unique_ids(server):
     """Each create() returns a distinct sandbox ID."""
     ids = [server.create() for _ in range(3)]
