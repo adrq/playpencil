@@ -17,6 +17,17 @@ pub(crate) fn project_wire_state(
 ) -> &'static str {
     use DesiredState as D;
     use State as S;
+    // Ordered precedence, first match wins. The in-flight rules (4, 5) are
+    // STATE-BASED: they require the committed state to still differ from the
+    // target. This is deliberate — the reconciler broadcasts state=Running before
+    // do_start's converge() and state=Stopped before do_stop's converge(), so a
+    // state-based projection reads those broadcasts as the terminal "Running" /
+    // "Stopped" and the SSE stream observes convergence WITHOUT needing a
+    // converge() broadcast. (A cursor-only in-flight rule would project "Pending"
+    // on that terminal broadcast and the client would hang.)
+    // The Failed-latch (observed == generation) is checked before the in-flight
+    // rules so it is never masked; the desired=Destroyed rule wins over a stop or
+    // a latched Failed.
     if state == Some(S::Destroyed) {
         return "Terminated";
     }
@@ -28,6 +39,12 @@ pub(crate) fn project_wire_state(
     }
     if desired == D::Running && state != Some(S::Running) && observed_generation < generation {
         return "Pending";
+    }
+    // Native stop-in-flight: a stop was accepted (desired=Stopped) while the VM is
+    // still Running and the reconciler has not yet converged. Lets a /v1x stop be
+    // positively observable instead of reading steady Running until it flips.
+    if desired == D::Stopped && state == Some(S::Running) && observed_generation < generation {
+        return "Stopping";
     }
     match state {
         None => "Pending",
@@ -151,10 +168,24 @@ mod tests {
             project_wire_state(Some(State::Running), DesiredState::Running, 1, 1),
             "Running"
         );
-        // Native stop-in-flight still projects Running.
+        // Native stop-in-flight (desired=Stopped, still Running, not yet
+        // converged) now projects Stopping so the /v1x stop is observable.
         assert_eq!(
             project_wire_state(Some(State::Running), DesiredState::Stopped, 2, 1),
+            "Stopping"
+        );
+        // Guard: the stop-in-flight rule requires observed < generation. A
+        // converged (observed == generation) Running with desired=Stopped reads
+        // Running, not Stopping (the stop rule must not shadow steady Running).
+        assert_eq!(
+            project_wire_state(Some(State::Running), DesiredState::Stopped, 1, 1),
             "Running"
+        );
+        // Guard: destroy-in-flight from Running still wins as Stopping via the
+        // desired=Destroyed rule, unaffected by the stop rule.
+        assert_eq!(
+            project_wire_state(Some(State::Running), DesiredState::Destroyed, 2, 1),
+            "Stopping"
         );
     }
 }

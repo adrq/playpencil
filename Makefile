@@ -23,7 +23,7 @@ check:
 
 test: all test-rust
 	cargo build
-	uv run pytest -v tests
+	uv run pytest -n4 -v tests
 
 test-rust:
 	cargo test

@@ -116,21 +116,23 @@ pub(crate) async fn get_sandbox<B: SandboxBackendSend + Sync + 'static>(
 pub(crate) async fn start_sandbox<B: SandboxBackendSend + Sync + 'static>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let sid = SandboxId(id);
     state.backend.start(&sid).await?;
     let view = state.backend.status(&sid).await?;
-    Ok(Json(build_response(&view)))
+    // Accepted-not-converged: intent is set; convergence is observed by polling.
+    Ok((StatusCode::ACCEPTED, Json(build_response(&view))).into_response())
 }
 
 pub(crate) async fn stop_sandbox<B: SandboxBackendSend + Sync + 'static>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let sid = SandboxId(id);
     state.backend.stop(&sid).await?;
     let view = state.backend.status(&sid).await?;
-    Ok(Json(build_response(&view)))
+    // Accepted-not-converged: intent is set; convergence is observed by polling.
+    Ok((StatusCode::ACCEPTED, Json(build_response(&view))).into_response())
 }
 
 pub(crate) async fn destroy_sandbox<B: SandboxBackendSend + Sync + 'static>(
@@ -189,20 +191,31 @@ pub(crate) async fn sandbox_events<B: SandboxBackendSend + Sync + 'static>(
         Err(e) => return Err(e.into()),
     };
 
-    // (c) Re-check to close the TOCTOU window between (a) and (b).
-    let gone = match state.backend.status(&sid).await {
-        Ok(v) => {
-            project_wire_state(
-                v.status.state,
-                v.status.desired,
-                v.status.generation,
-                v.status.observed_generation,
-            ) == "Terminated"
-        }
-        Err(BackendError::NotFound) => true,
-        Err(_) => false,
+    // (c) Re-check to close the TOCTOU window between (a) and (b), and capture
+    // the current projected wire state to seed the stream (snapshot-on-connect).
+    // The backend channel is a plain broadcast with no replay, so a subscriber
+    // that joins after a transition completed would otherwise hang waiting for
+    // the next delta; the seed lets it observe the current state immediately.
+    // After the seed the stream is BEST-EFFORT: backend transitions are forwarded
+    // as-is, so a transition committed in the [subscribe, snapshot] window may be
+    // re-emitted (at-least-once duplicate / brief reorder at connect). Polling GET
+    // to the per-verb terminal target is the canonical convergence mechanism; SSE
+    // is a supplementary live feed. Subscribe-first ordering is
+    // kept deliberately (reordering would reintroduce a miss/hang).
+    //
+    // NotFound/Terminated collapses to the single terminal response; a transient
+    // status error yields no snapshot (no seed) but still forwards deltas.
+    let snapshot: Option<&'static str> = match state.backend.status(&sid).await {
+        Ok(v) => Some(project_wire_state(
+            v.status.state,
+            v.status.desired,
+            v.status.generation,
+            v.status.observed_generation,
+        )),
+        Err(BackendError::NotFound) => Some("Terminated"),
+        Err(_) => None,
     };
-    if gone {
+    if snapshot == Some("Terminated") {
         drop(rx);
         return Ok(single_terminated_response(&id, &state.shutdown));
     }
@@ -210,6 +223,16 @@ pub(crate) async fn sandbox_events<B: SandboxBackendSend + Sync + 'static>(
     // Forward committed transitions. A forwarded Terminated ends the stream
     // (the retained per-sandbox sender never closes on its own).
     let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    // Seed with a snapshot of the current state. snapshot is non-terminal here
+    // (Terminated returned above); the channel is fresh (capacity 64) so the
+    // send cannot block.
+    if let Some(wire) = snapshot {
+        let ev = Event::default()
+            .event("state_change")
+            .json_data(serde_json::json!({ "sandbox_id": id, "state": wire }))
+            .unwrap_or_else(|_| Event::default());
+        let _ = tx.try_send(Ok(ev));
+    }
     let shutdown = state.shutdown.clone();
     let stream_id = id.clone();
     tokio::spawn(async move {
@@ -217,6 +240,10 @@ pub(crate) async fn sandbox_events<B: SandboxBackendSend + Sync + 'static>(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                // Client disconnected (out_rx dropped): wake even on a quiet
+                // stream so the broadcast receiver is released promptly instead
+                // of leaking until the next event or server shutdown.
+                _ = tx.closed() => break,
                 msg = rx.recv() => match msg {
                     Ok(status) => {
                         let wire = project_wire_state(
@@ -282,4 +309,118 @@ pub(crate) async fn resume_sandbox<B: SandboxBackendSend + Sync + 'static>(
             sandbox_id: None,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    use playpencil_core::backend::mock::MockBackend;
+    use playpencil_core::lifecycle::State;
+    use playpencil_core::types::{NetworkPolicy, ResourceLimits, SandboxConfig};
+
+    use crate::router::build_router;
+
+    fn test_config() -> SandboxConfig {
+        SandboxConfig {
+            name: None,
+            image: "test:latest".into(),
+            resource_limits: ResourceLimits {
+                cpus: None,
+                memory_bytes: None,
+                disk_bytes: None,
+            },
+            mounts: vec![],
+            network: NetworkPolicy::Isolated,
+            env: vec![],
+        }
+    }
+
+    async fn await_running(backend: &MockBackend, id: &SandboxId) {
+        for _ in 0..200 {
+            if let Ok(v) = backend.status(id).await
+                && v.status.state == Some(State::Running)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("sandbox did not reach Running");
+    }
+
+    // Start/stop are accepted-not-converged and return 202, matching create.
+    #[tokio::test]
+    async fn start_and_stop_return_202() {
+        let state = AppState::new(MockBackend::new());
+        let backend = state.backend.clone();
+        let id = backend.create_and_start(test_config()).await.unwrap();
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1x/sandboxes/{}/start", id.0))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1x/sandboxes/{}/stop", id.0))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // A subscriber that connects after the sandbox has settled still receives
+    // a snapshot event carrying the current state (no replay from the backend
+    // broadcast, so without the seed it would hang).
+    #[tokio::test]
+    async fn events_snapshot_on_connect_after_settled() {
+        let state = AppState::new(MockBackend::new());
+        let backend = state.backend.clone();
+        let id = backend.create_and_start(test_config()).await.unwrap();
+        await_running(&backend, &id).await;
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1x/sandboxes/{}/events", id.0))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut stream = resp.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(
+            Duration::from_secs(2),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("snapshot event not received before timeout")
+        .expect("event stream ended without a snapshot")
+        .expect("event stream body error");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(
+            text.contains("state_change") && text.contains("Running"),
+            "expected snapshot state_change=Running, got: {text:?}"
+        );
+    }
 }

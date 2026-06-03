@@ -48,7 +48,10 @@ pub(crate) struct SandboxResponse {
     pub status: StatusWire,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-    // Config-derived fields are absent for destroyed sandboxes (config removed on destroy).
+    // Config-derived fields. The durable record retains config across destroy, so
+    // these remain present for Terminated sandboxes; `env` is never put on the wire.
+    // `image`/`network` are always Some today (build_response fills them), so their
+    // skip_serializing_if is currently inert but kept for shape stability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

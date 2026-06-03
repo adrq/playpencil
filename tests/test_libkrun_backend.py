@@ -163,11 +163,11 @@ class SandboxClient:
 
     def start(self, sandbox_id):
         status, body = self._request("POST", f"/v1x/sandboxes/{sandbox_id}/start")
-        assert status == 200, f"start failed: {status} {body}"
+        assert status == 202, f"start failed: {status} {body}"
 
     def stop(self, sandbox_id):
         status, body = self._request("POST", f"/v1x/sandboxes/{sandbox_id}/stop")
-        assert status == 200, f"stop failed: {status} {body}"
+        assert status == 202, f"stop failed: {status} {body}"
 
     def destroy(self, sandbox_id):
         status, body = self._request("DELETE", f"/v1/sandboxes/{sandbox_id}")
