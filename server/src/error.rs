@@ -1,7 +1,8 @@
 use axum::Json;
-use axum::extract::FromRequest;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{FromRequest, FromRequestParts, Query};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
@@ -27,6 +28,26 @@ where
     }
 }
 
+/// Query-string extractor that routes deserialization failures (missing or
+/// malformed query params) through `ApiError`, mirroring [`ValidatedJson`] so
+/// query errors carry the same status and JSON shape as the rest of the API.
+pub(crate) struct ValidatedQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ValidatedQuery<T>
+where
+    Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(value) = Query::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(|rejection| ApiError::Validation(rejection.body_text()))?;
+        Ok(ValidatedQuery(value))
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct ErrorResponse {
     pub error: String,
@@ -39,6 +60,9 @@ pub(crate) struct ErrorResponse {
 pub(crate) enum ApiError {
     Backend(BackendError),
     Validation(String),
+    /// A valid-but-unsupported feature (reserved surfaces, `background:true`).
+    /// Resolved only after a successful sandbox lookup, so it never masks a 404.
+    NotImplemented(String),
     StatusQueryFailed {
         sandbox_id: String,
         source: BackendError,
@@ -75,6 +99,12 @@ impl IntoResponse for ApiError {
             Self::Validation(msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_error",
+                Some(msg),
+                None,
+            ),
+            Self::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
                 Some(msg),
                 None,
             ),

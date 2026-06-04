@@ -8,7 +8,13 @@ import time
 
 import pytest
 
-from conftest import REPO_ROOT, get_last_error, read_pp_string
+from conftest import (
+    ALPINE_IMAGE_FFI,
+    REPO_ROOT,
+    get_last_error,
+    read_pp_string,
+    seed_image_cache,
+)
 
 
 def _wait_state(pplib, sb, want, timeout=90):
@@ -119,7 +125,7 @@ def _make_runtime_config(data_dir):
     ).encode("utf-8")
 
 
-def _sandbox_config(image="alpine:3.21"):
+def _sandbox_config(image=ALPINE_IMAGE_FFI):
     return json.dumps(
         {
             "image": image,
@@ -141,6 +147,7 @@ def ffi_runtime(pplib):
     if not INIT_BINARY.exists():
         pytest.fail(f"Init binary not found at {INIT_BINARY}. Run 'make all' first.")
     with tempfile.TemporaryDirectory() as tmpdir:
+        seed_image_cache(tmpdir)
         cfg = _make_runtime_config(tmpdir)
         rt = pplib.pp_runtime_new(cfg)
         assert rt is not None, f"pp_runtime_new failed: {get_last_error(pplib)}"
@@ -174,6 +181,50 @@ def test_ffi_create_and_start(pplib, ffi_runtime):
     assert sb is not None, f"create_and_start failed: {get_last_error(pplib)}"
     _wait_state(pplib, sb, "running")
     assert pplib.pp_sandbox_destroy(sb) == 0
+    _wait_state(pplib, sb, "destroyed")
+    pplib.pp_sandbox_free(sb)
+
+
+def test_ffi_exec_gid_without_uid_is_invalid_input(pplib, ffi_runtime):
+    """The credential invariant is enforced at the core/FFI boundary, not only in
+    the HTTP/WS adapters: a gid with no uid is rejected as invalid input before
+    the running-state gate or any guest dispatch, so a C-ABI caller cannot request
+    a credential drop that silently runs with the default (typically root) creds.
+
+    No VM boot needed — the rejection happens on a provisioned-but-stopped
+    sandbox, before exec would require the running state.
+    """
+    sb = pplib.pp_sandbox_create(ffi_runtime, _sandbox_config())
+    assert sb is not None, f"create failed: {get_last_error(pplib)}"
+    _wait_state(pplib, sb, "stopped")
+
+    cmd = json.dumps({"command": ["id"], "env": [], "gid": 5}).encode("utf-8")
+    exec_h = pplib.pp_sandbox_exec(sb, cmd)
+    assert exec_h is None, "exec must be refused when gid is set without uid"
+    err = get_last_error(pplib)
+    assert err is not None and "gid requires uid" in err, err
+
+    pplib.pp_sandbox_destroy(sb)
+    _wait_state(pplib, sb, "destroyed")
+    pplib.pp_sandbox_free(sb)
+
+
+def test_ffi_exec_invalid_env_is_invalid_input(pplib, ffi_runtime):
+    """Env is validated at the core/FFI boundary (not only at sandbox creation):
+    a key containing '=' is rejected as invalid input before guest dispatch, so it
+    can't become a guest-side start error or be re-split by putenv. No VM boot
+    needed — rejection happens on a provisioned-but-stopped sandbox."""
+    sb = pplib.pp_sandbox_create(ffi_runtime, _sandbox_config())
+    assert sb is not None, f"create failed: {get_last_error(pplib)}"
+    _wait_state(pplib, sb, "stopped")
+
+    cmd = json.dumps({"command": ["env"], "env": [["BAD=KEY", "v"]]}).encode("utf-8")
+    exec_h = pplib.pp_sandbox_exec(sb, cmd)
+    assert exec_h is None, "exec must be refused for an invalid env entry"
+    err = get_last_error(pplib)
+    assert err is not None and "env key" in err, err
+
+    pplib.pp_sandbox_destroy(sb)
     _wait_state(pplib, sb, "destroyed")
     pplib.pp_sandbox_free(sb)
 

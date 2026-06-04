@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// How the guest interprets an exec command vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    /// `cmd` is an argv vector run via `execvp(cmd[0], cmd)`.
+    #[default]
+    Argv,
+    /// `cmd[0]` is a shell line run via the resolved shell (`-c`).
+    Shell,
+}
+
 /// Messages sent from the host to the guest (incoming).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -11,6 +22,12 @@ pub enum HostMessage {
         env: Vec<String>,
         #[serde(default)]
         workdir: Option<String>,
+        #[serde(default)]
+        uid: Option<u32>,
+        #[serde(default)]
+        gid: Option<u32>,
+        #[serde(default)]
+        mode: ExecMode,
     },
     Stdin {
         id: String,
@@ -26,15 +43,48 @@ pub enum HostMessage {
         cols: u32,
         rows: u32,
     },
+    /// Output flow-control: stop reading this child's stdout/stderr.
+    Pause {
+        id: String,
+    },
+    /// Output flow-control: resume reading this child's stdout/stderr.
+    Resume {
+        id: String,
+    },
 }
 
 /// Messages sent from the guest to the host (outgoing).
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuestMessage {
-    Stdout { id: String, data: String },
-    Stderr { id: String, data: String },
-    Exit { id: String, code: i32 },
+    Stdout {
+        id: String,
+        data: String,
+    },
+    Stderr {
+        id: String,
+        data: String,
+    },
+    Exit {
+        id: String,
+        code: i32,
+    },
+    /// The command never started as intended (distinct from a numeric exit).
+    StartError {
+        id: String,
+        message: String,
+    },
+    /// Input flow-control: grant the host `bytes` more stdin send-credit.
+    StdinCredit {
+        id: String,
+        bytes: usize,
+    },
+    /// The child closed its stdin while still running: the host must stop
+    /// sending stdin for this id (its relay terminates so writes fail loudly
+    /// rather than waiting on credit that will never be granted).
+    StdinClosed {
+        id: String,
+    },
 }
 
 const BASE64_ALPHABET: &[u8; 64] =
@@ -168,6 +218,7 @@ mod tests {
                 cmd,
                 env,
                 workdir,
+                ..
             } => {
                 assert_eq!(id, "e1");
                 assert_eq!(cmd, vec!["echo", "hi"]);
@@ -183,12 +234,64 @@ mod tests {
         let json = r#"{"type":"exec","id":"e2","cmd":["ls"]}"#;
         let msg: HostMessage = serde_json::from_str(json).unwrap();
         match msg {
-            HostMessage::Exec { env, workdir, .. } => {
+            HostMessage::Exec {
+                env,
+                workdir,
+                uid,
+                gid,
+                mode,
+                ..
+            } => {
                 assert!(env.is_empty());
                 assert_eq!(workdir, None);
+                // Additive fields default so old hosts stay wire-compatible.
+                assert_eq!(uid, None);
+                assert_eq!(gid, None);
+                assert_eq!(mode, ExecMode::Argv);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_host_message_exec_shell_mode_and_creds() {
+        let json = r#"{"type":"exec","id":"e3","cmd":["echo hi | wc -c"],"mode":"shell","uid":1000,"gid":2000}"#;
+        let msg: HostMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            HostMessage::Exec { mode, uid, gid, .. } => {
+                assert_eq!(mode, ExecMode::Shell);
+                assert_eq!(uid, Some(1000));
+                assert_eq!(gid, Some(2000));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_pause_resume_deserialize() {
+        let p: HostMessage = serde_json::from_str(r#"{"type":"pause","id":"e1"}"#).unwrap();
+        assert!(matches!(p, HostMessage::Pause { id } if id == "e1"));
+        let r: HostMessage = serde_json::from_str(r#"{"type":"resume","id":"e1"}"#).unwrap();
+        assert!(matches!(r, HostMessage::Resume { id } if id == "e1"));
+    }
+
+    #[test]
+    fn test_guest_start_error_and_credit_serialize() {
+        let se = GuestMessage::StartError {
+            id: "e1".into(),
+            message: "no shell available".into(),
+        };
+        let json = serde_json::to_string(&se).unwrap();
+        assert!(json.contains("\"type\":\"start_error\""));
+        assert!(json.contains("\"message\":\"no shell available\""));
+
+        let cr = GuestMessage::StdinCredit {
+            id: "e1".into(),
+            bytes: 4096,
+        };
+        let json = serde_json::to_string(&cr).unwrap();
+        assert!(json.contains("\"type\":\"stdin_credit\""));
+        assert!(json.contains("\"bytes\":4096"));
     }
 
     #[test]

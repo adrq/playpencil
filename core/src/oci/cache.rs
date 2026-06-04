@@ -75,6 +75,18 @@ impl ImageCache {
         client: &mut RegistryClient,
         image: &ImageReference,
     ) -> Result<PathBuf, OciError> {
+        // A digest-pinned reference names immutable content, so a cache hit is
+        // definitionally the right bits: short-circuit before any network call.
+        // The pinned digest must be the platform-specific manifest digest for the
+        // host arch (our cache key); if it is something else (e.g. an index) the
+        // lookup misses and we fall through to the normal resolve+pull. A tag
+        // reference is mutable, so it always resolves to learn its current digest.
+        if let Some(digest) = image.digest()
+            && let Some(rootfs) = self.get(digest)
+        {
+            return Ok(rootfs);
+        }
+
         let (manifest, digest) = client.resolve_manifest(image).await?;
         let hex = validate_digest(&digest)?;
 
@@ -282,6 +294,25 @@ mod tests {
                 .get("sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_digest_pinned_short_circuits_cache_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(tmp.path());
+        let hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let rootfs = tmp.path().join("images/sha256").join(hex).join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+
+        // Pin the cached digest behind an unreachable registry (127.0.0.1:1): any
+        // resolve/pull would fail fast, so a successful return proves ensure()
+        // returned the cached rootfs without touching the client at all.
+        let image: ImageReference = format!("127.0.0.1:1/library/x@sha256:{hex}")
+            .parse()
+            .unwrap();
+        let mut client = RegistryClient::new().unwrap();
+        let result = cache.ensure(&mut client, &image).await.unwrap();
+        assert_eq!(result, rootfs);
     }
 
     #[test]

@@ -82,3 +82,27 @@ pub(crate) struct ListSandboxesResponse {
 pub(crate) struct ListParams {
     pub state: Option<String>,
 }
+
+/// Body of a foreground command request on the execd-compatible command face.
+#[derive(Deserialize)]
+pub(crate) struct CommandRequest {
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub gid: Option<u32>,
+    #[serde(default)]
+    pub envs: HashMap<String, String>,
+}
+
+/// Query for `DELETE …/execd/command?id=<command-id>`.
+#[derive(Deserialize)]
+pub(crate) struct CommandDeleteParams {
+    pub id: String,
+}

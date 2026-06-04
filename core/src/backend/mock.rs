@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use crate::lifecycle::{DesiredState, Verb};
 use crate::store::{InMemoryStore, PersistedRecord};
 use crate::types::{
-    ExecHandle, ExecId, ExecRequest, SandboxConfig, SandboxId, SandboxStatus, SandboxView,
+    ExecHandle, ExecId, ExecRequest, NoopBackchannel, SandboxConfig, SandboxId, SandboxStatus,
+    SandboxView,
 };
 
 use super::reconciler::{
@@ -196,8 +197,13 @@ impl SandboxBackendSend for MockBackend {
         Ok(ExecHandle {
             exec_id,
             events: events_rx,
-            stdin: stdin_tx,
-            control: ctrl_tx,
+            io: crate::types::ExecIo {
+                stdin: stdin_tx,
+                control: ctrl_tx,
+                backchannel: std::sync::Arc::new(NoopBackchannel),
+                stdin_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stdin_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            },
         })
     }
 
@@ -340,6 +346,9 @@ mod tests {
             command: vec!["echo".into()],
             working_dir: None,
             env: vec![],
+            uid: None,
+            gid: None,
+            mode: Default::default(),
         };
         assert!(matches!(
             backend.exec(&id, req).await,
@@ -351,6 +360,9 @@ mod tests {
             command: vec!["echo".into()],
             working_dir: None,
             env: vec![],
+            uid: None,
+            gid: None,
+            mode: Default::default(),
         };
         let handle = backend.exec(&id, req).await.unwrap();
         assert!(handle.exec_id.0.starts_with("exec-"));

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::libkrun::LibkrunBackend;
 use crate::backend::{BackendError, SandboxBackendSend};
 use crate::rootfs::linux::LinuxRootfsProvider;
-use crate::types::{ExecControl, ExecEvent, ExecRequest, SandboxConfig, SandboxId};
+use crate::types::{ExecEvent, ExecIo, ExecRequest, SandboxConfig, SandboxId};
 
 // ---------------------------------------------------------------------------
 // Thread-local last error
@@ -76,8 +76,7 @@ pub struct PpSandbox {
 
 pub struct PpExec {
     events: Mutex<tokio::sync::mpsc::Receiver<ExecEvent>>,
-    stdin: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
-    control: tokio::sync::mpsc::Sender<ExecControl>,
+    io: ExecIo,
     inner: Arc<RuntimeInner>,
 }
 
@@ -112,10 +111,11 @@ fn in_async_context() -> bool {
 /// Wire format for exec events over the C ABI. Binary data is base64-encoded
 /// so it survives as a NUL-terminated C string.
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum ExecEventDto {
     Stdout { data: String },
     Stderr { data: String },
+    StartError { message: String },
     Exit { code: i32 },
 }
 
@@ -127,6 +127,9 @@ impl From<&ExecEvent> for ExecEventDto {
             },
             ExecEvent::Stderr(data) => Self::Stderr {
                 data: crate::util::base64_encode(data),
+            },
+            ExecEvent::StartError(message) => Self::StartError {
+                message: message.clone(),
             },
             ExecEvent::Exit { code } => Self::Exit { code: *code },
         }
@@ -492,10 +495,10 @@ pub unsafe extern "C" fn pp_sandbox_exec(
             }
         };
 
+        let (events, io) = handle.split();
         let exec = PpExec {
-            events: Mutex::new(handle.events),
-            stdin: Mutex::new(Some(handle.stdin)),
-            control: handle.control,
+            events: Mutex::new(events),
+            io,
             inner,
         };
         Box::into_raw(Box::new(exec))
@@ -524,7 +527,18 @@ pub unsafe extern "C" fn pp_exec_next_event(exec: *mut PpExec) -> *mut c_char {
             exec.inner.tokio_rt.block_on(rx.recv())
         };
         match event {
-            Some(event) => string_to_c(exec_event_to_json(&event)),
+            Some(event) => {
+                // The C caller is the consumer: release output credit (raw
+                // process bytes) for the data we are handing it.
+                let raw = match &event {
+                    ExecEvent::Stdout(b) | ExecEvent::Stderr(b) => b.len(),
+                    _ => 0,
+                };
+                if raw > 0 {
+                    exec.io.release_credit(raw);
+                }
+                string_to_c(exec_event_to_json(&event))
+            }
             None => std::ptr::null_mut(), // EOF — last_error stays NULL
         }
     })
@@ -559,24 +573,14 @@ pub unsafe extern "C" fn pp_exec_write_stdin(
             return -1;
         }
         let exec = unsafe { &*exec };
-        let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-        // Clone the sender out of the mutex before calling block_on.
-        // Holding the mutex across block_on would deadlock if the channel
-        // is full and a concurrent pp_exec_close_stdin tries to lock.
-        let tx = {
-            let guard = exec.stdin.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().cloned()
-        };
-        match tx {
-            Some(tx) => match exec.inner.tokio_rt.block_on(tx.send(bytes)) {
-                Ok(()) => 0,
-                Err(_) => {
-                    set_last_error("stdin channel closed");
-                    -1
-                }
-            },
-            None => {
-                set_last_error("stdin already closed");
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        // Byte-bounded ingress: write_stdin splits into frames no larger than the
+        // per-frame cap so a single huge call never buffers an unbounded Vec; the
+        // bounded relay channel back-pressures the caller between chunks.
+        match exec.inner.tokio_rt.block_on(exec.io.write_stdin(bytes)) {
+            Ok(()) => 0,
+            Err(()) => {
+                set_last_error("stdin channel closed");
                 -1
             }
         }
@@ -593,10 +597,13 @@ pub unsafe extern "C" fn pp_exec_close_stdin(exec: *mut PpExec) -> i32 {
             set_last_error("exec handle is NULL");
             return -1;
         }
+        if in_async_context() {
+            return -1;
+        }
         let exec = unsafe { &*exec };
-        let mut guard = exec.stdin.lock().unwrap_or_else(|e| e.into_inner());
-        // Drop the sender to signal EOF. Idempotent.
-        *guard = None;
+        // Signal EOF to the guest. Idempotent: a second close (relay already
+        // gone) is a no-op.
+        let _ = exec.inner.tokio_rt.block_on(exec.io.close_stdin());
         0
     })
 }
@@ -615,11 +622,7 @@ pub unsafe extern "C" fn pp_exec_signal(exec: *mut PpExec, signum: i32) -> i32 {
             return -1;
         }
         let exec = unsafe { &*exec };
-        match exec
-            .inner
-            .tokio_rt
-            .block_on(exec.control.send(ExecControl::Signal(signum)))
-        {
+        match exec.inner.tokio_rt.block_on(exec.io.signal(signum)) {
             Ok(()) => 0,
             Err(_) => {
                 set_last_error("control channel closed");
@@ -643,11 +646,7 @@ pub unsafe extern "C" fn pp_exec_resize(exec: *mut PpExec, cols: u16, rows: u16)
             return -1;
         }
         let exec = unsafe { &*exec };
-        match exec
-            .inner
-            .tokio_rt
-            .block_on(exec.control.send(ExecControl::Resize { cols, rows }))
-        {
+        match exec.inner.tokio_rt.block_on(exec.io.resize(cols, rows)) {
             Ok(()) => 0,
             Err(_) => {
                 set_last_error("control channel closed");

@@ -1,6 +1,8 @@
 """Shared fixtures for playpencil tests."""
 
 import ctypes
+import os
+import shutil
 from ctypes import c_char_p, c_int, c_void_p, c_uint16, c_size_t, POINTER, c_ubyte
 from pathlib import Path
 
@@ -9,6 +11,47 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent
 BIN_DIR = REPO_ROOT / "bin"
 PLAYPENCIL_BIN = BIN_DIR / "playpencil"
+
+# Digest-pinned test images. A digest is immutable, so the image cache can serve
+# it from the local seed without any registry round-trip (see seed_image_cache).
+# These digests are the platform-specific (host-arch) manifest digests, which is
+# the cache key the rootfs is stored under.
+ALPINE_IMAGE_BACKEND = (
+    "alpine@sha256:b58899f069c47216f6002a6850143dc6fae0d35eb8b0df9300bbe6327b9c2171"
+)
+ALPINE_IMAGE_FFI = (
+    "alpine@sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339"
+)
+
+# Shared, pre-extracted image cache. Override with PLAYPENCIL_TEST_IMAGE_CACHE.
+# This is an interim known location, not a blessed production path.
+DEFAULT_TEST_IMAGE_CACHE = Path.home() / ".cache" / "playpencil" / "test-images"
+
+
+def test_image_cache_dir():
+    """Resolve the seed image-cache directory (env override or default)."""
+    env = os.environ.get("PLAYPENCIL_TEST_IMAGE_CACHE")
+    return Path(env) if env else DEFAULT_TEST_IMAGE_CACHE
+
+
+def seed_image_cache(data_dir):
+    """Point ``<data_dir>/images`` at the shared seed cache so digest-pinned
+    images resolve fully offline.
+
+    No-op if the seed directory is absent, so tests gracefully fall back to a
+    normal registry pull on a machine without the seed.
+    """
+    seed = test_image_cache_dir()
+    if not seed.is_dir():
+        return
+    images = Path(data_dir) / "images"
+    if images.exists() or images.is_symlink():
+        return
+    try:
+        images.symlink_to(seed, target_is_directory=True)
+    except OSError:
+        # Symlink unavailable (e.g. cross-device under xdist): copy the seed.
+        shutil.copytree(seed, images)
 
 
 @pytest.fixture

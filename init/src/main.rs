@@ -13,8 +13,20 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use console::{Console, find_and_open_exec_console, poll_and_read_line, write_line};
-use exec::{ExecEntry, check_child_exit, read_pipe_chunk, start_exec};
-use proto::{GuestMessage, HostMessage, base64_decode, base64_encode};
+use exec::{
+    CREDIT_GRANT_THRESHOLD, ExecEntry, INPUT_WINDOW, check_child_exit, read_pipe_chunk,
+    read_start_err, start_exec,
+};
+use proto::{GuestMessage, HostMessage, base64_decode};
+
+/// Which child fd a poll slot refers to.
+#[derive(Clone, Copy)]
+enum FdKind {
+    Stdout,
+    Stderr,
+    Stdin,
+    StartErr,
+}
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -52,7 +64,10 @@ fn main() {
             break;
         }
 
-        // Build pollfd array: console first, then all active child stdout/stderr pipes.
+        // Build pollfd array: console first (always polled so signals/pause are
+        // never head-of-line blocked), then per-exec output pipes (skipped when
+        // output-paused), the stdin pipe (POLLOUT when buffered data is pending),
+        // and the pre-exec start-error pipe.
         let mut pollfds: Vec<libc::pollfd> = Vec::new();
         let console_fd = console.as_raw_fd();
         pollfds.push(libc::pollfd {
@@ -61,24 +76,41 @@ fn main() {
             revents: 0,
         });
 
-        // fd_map[i] pairs with pollfds[i+1]: (exec id, is_stderr)
-        let mut fd_map: Vec<(String, bool)> = Vec::new();
+        // fd_map[i] pairs with pollfds[i+1]: (exec id, fd kind)
+        let mut fd_map: Vec<(String, FdKind)> = Vec::new();
         for (id, entry) in &execs {
-            if !entry.stdout_closed {
+            // Output is suppressed while paused: the child's write() blocks.
+            if !entry.stdout_closed && !entry.paused {
                 pollfds.push(libc::pollfd {
                     fd: entry.stdout_fd,
                     events: libc::POLLIN,
                     revents: 0,
                 });
-                fd_map.push((id.clone(), false));
+                fd_map.push((id.clone(), FdKind::Stdout));
             }
-            if !entry.stderr_closed {
+            if !entry.stderr_closed && !entry.paused {
                 pollfds.push(libc::pollfd {
                     fd: entry.stderr_fd,
                     events: libc::POLLIN,
                     revents: 0,
                 });
-                fd_map.push((id.clone(), true));
+                fd_map.push((id.clone(), FdKind::Stderr));
+            }
+            if entry.stdin_fd >= 0 && !entry.stdin_buf.is_empty() {
+                pollfds.push(libc::pollfd {
+                    fd: entry.stdin_fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                });
+                fd_map.push((id.clone(), FdKind::Stdin));
+            }
+            if entry.start_err_fd >= 0 && !entry.start_err_closed {
+                pollfds.push(libc::pollfd {
+                    fd: entry.start_err_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                fd_map.push((id.clone(), FdKind::StartErr));
             }
         }
 
@@ -116,21 +148,45 @@ fn main() {
             SHUTDOWN_REQUESTED.store(true, Relaxed);
         }
 
-        // Child output pipes.
-        for (i, (id, is_stderr)) in fd_map.iter().enumerate() {
+        // Per-exec fds.
+        for (i, (id, kind)) in fd_map.iter().enumerate() {
             let pfd = &pollfds[i + 1];
-            if pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-                continue;
-            }
-            let (msg_opt, closed) = read_pipe_chunk(id, pfd.fd, *is_stderr);
-            if let Some(msg) = msg_opt {
-                send_guest_message(&console, &msg);
-            }
-            if closed && let Some(entry) = execs.get_mut(id) {
-                if *is_stderr {
-                    entry.stderr_closed = true;
-                } else {
-                    entry.stdout_closed = true;
+            match kind {
+                FdKind::Stdout | FdKind::Stderr => {
+                    if pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                        continue;
+                    }
+                    let is_stderr = matches!(kind, FdKind::Stderr);
+                    let (msg_opt, closed) = read_pipe_chunk(id, pfd.fd, is_stderr);
+                    if let Some(msg) = msg_opt {
+                        send_guest_message(&console, &msg);
+                    }
+                    if closed && let Some(entry) = execs.get_mut(id) {
+                        if is_stderr {
+                            entry.stderr_closed = true;
+                        } else {
+                            entry.stdout_closed = true;
+                        }
+                    }
+                }
+                FdKind::Stdin => {
+                    if pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+                        continue;
+                    }
+                    if let Some(entry) = execs.get_mut(id) {
+                        drain_child_stdin(id, entry, &console);
+                    }
+                }
+                FdKind::StartErr => {
+                    if pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                        continue;
+                    }
+                    if let Some(entry) = execs.get_mut(id) {
+                        let fd = entry.start_err_fd;
+                        if read_start_err(fd, &mut entry.start_err_buf) {
+                            entry.start_err_closed = true;
+                        }
+                    }
                 }
             }
         }
@@ -162,45 +218,72 @@ fn dispatch_line(line: &str, execs: &mut HashMap<String, ExecEntry>, console: &C
             cmd,
             env,
             workdir,
+            uid,
+            gid,
+            mode,
         } => match execs.entry(id) {
             Entry::Occupied(occ) => {
-                let id = occ.key().clone();
-                eprintln!("init: duplicate exec id {id}, rejecting");
-                send_guest_message(console, &GuestMessage::Exit { id, code: -1 });
+                // A duplicate exec frame for a LIVE id: ignore it, leaving the
+                // existing child and the host's session for that id intact. The
+                // host mints unique ids, so this only happens under a malformed or
+                // replayed frame — and a StartError here would terminalize the
+                // host's existing session (it maps StartError{id} to removal),
+                // closing the live ExecHandle while the original child keeps
+                // running and its output/exit are then dropped as "unknown id".
+                eprintln!("init: duplicate exec id {}, ignoring", occ.key());
             }
-            Entry::Vacant(slot) => match start_exec(&cmd, &env, workdir.as_deref()) {
-                Ok(entry) => {
-                    slot.insert(entry);
+            Entry::Vacant(slot) => {
+                match start_exec(&cmd, &env, workdir.as_deref(), uid, gid, mode) {
+                    Ok(entry) => {
+                        slot.insert(entry);
+                    }
+                    Err(e) => {
+                        let id = slot.into_key();
+                        eprintln!("init: exec failed: {e}");
+                        // A host-detected pre-fork failure (empty/NUL command,
+                        // fork error) is a start-error, not a numeric exit.
+                        send_guest_message(console, &GuestMessage::StartError { id, message: e });
+                    }
                 }
-                Err(e) => {
-                    let id = slot.into_key();
-                    eprintln!("init: exec failed: {e}");
-                    // Send the validation error as stderr so the caller can diagnose
-                    // why the exec was rejected (empty command, bad workdir, etc.).
-                    let err_bytes = format!("exec error: {e}\n").into_bytes();
-                    send_guest_message(
-                        console,
-                        &GuestMessage::Stderr {
-                            id: id.clone(),
-                            data: base64_encode(&err_bytes),
-                        },
-                    );
-                    send_guest_message(console, &GuestMessage::Exit { id, code: -1 });
-                }
-            },
+            }
         },
         HostMessage::Stdin { id, data } => {
-            if let Some(entry) = execs.get_mut(&id)
-                && let Some(bytes) = base64_decode(&data)
-            {
-                if bytes.is_empty() {
-                    // Empty data = EOF: close stdin so the child sees EOF.
-                    if entry.stdin_fd >= 0 {
-                        unsafe { libc::close(entry.stdin_fd) };
-                        entry.stdin_fd = -1;
+            if let Some(entry) = execs.get_mut(&id) {
+                match base64_decode(&data) {
+                    // Malformed base64 is a fatal protocol error for this exec id
+                    // (host/guest desync): fail loud rather than silently dropping
+                    // input and risk the child hanging on stdin. SIGKILL the group
+                    // and let the normal terminal path report the (signalled) exit.
+                    None => {
+                        eprintln!("init: invalid stdin base64 for exec {id}; killing child");
+                        unsafe { libc::kill(-(entry.pid), libc::SIGKILL) };
+                        entry.stdin_buf.clear();
+                        if entry.stdin_fd >= 0 {
+                            unsafe { libc::close(entry.stdin_fd) };
+                            entry.stdin_fd = -1;
+                        }
                     }
-                } else {
-                    write_to_stdin(entry.stdin_fd, &bytes);
+                    Some(bytes) if bytes.is_empty() => {
+                        // Empty data = EOF: close once buffered stdin has drained.
+                        entry.stdin_eof_pending = true;
+                        if entry.stdin_buf.is_empty() && entry.stdin_fd >= 0 {
+                            unsafe { libc::close(entry.stdin_fd) };
+                            entry.stdin_fd = -1;
+                        }
+                    }
+                    Some(bytes) if entry.stdin_buf.len() + bytes.len() > INPUT_WINDOW => {
+                        // Defense-in-depth: a compliant host never overshoots the
+                        // credit window. An over-window frame is a fatal protocol
+                        // error — do NOT buffer it (so the invariant always holds),
+                        // SIGKILL the child group, and let the terminal path emit
+                        // the (signalled) exit. Fail loud, never silently truncate.
+                        eprintln!("init: stdin over-window for exec {id}; killing child");
+                        unsafe { libc::kill(-(entry.pid), libc::SIGKILL) };
+                    }
+                    Some(bytes) => {
+                        entry.stdin_buf.extend(bytes);
+                        drain_child_stdin(&id, entry, console);
+                    }
                 }
             }
         }
@@ -210,30 +293,78 @@ fn dispatch_line(line: &str, execs: &mut HashMap<String, ExecEntry>, console: &C
                 unsafe { libc::kill(-(entry.pid), signal) };
             }
         }
+        HostMessage::Pause { id } => {
+            if let Some(entry) = execs.get_mut(&id) {
+                entry.paused = true;
+            }
+        }
+        HostMessage::Resume { id } => {
+            if let Some(entry) = execs.get_mut(&id) {
+                entry.paused = false;
+            }
+        }
         HostMessage::Resize { .. } => {
             // PTY resize not supported; ignore.
         }
     }
 }
 
-fn write_to_stdin(fd: RawFd, data: &[u8]) {
-    let mut written = 0;
-    while written < data.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                data[written..].as_ptr() as *const libc::c_void,
-                data.len() - written,
-            )
+/// Write as much buffered stdin to the child as the nonblocking pipe accepts,
+/// then grant the host more credit for the freed bytes (batched). Never blocks:
+/// a stuck child just leaves bytes buffered (≤ INPUT_WINDOW) and the host stops
+/// sending once its window is exhausted.
+fn drain_child_stdin(id: &str, entry: &mut ExecEntry, console: &Console) {
+    while !entry.stdin_buf.is_empty() && entry.stdin_fd >= 0 {
+        let fd = entry.stdin_fd;
+        let n = {
+            let (front, _) = entry.stdin_buf.as_slices();
+            if front.is_empty() {
+                break;
+            }
+            unsafe { libc::write(fd, front.as_ptr() as *const libc::c_void, front.len()) }
         };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                break; // pipe full; try again on the next POLLOUT
+            }
+            // Child closed its stdin (EPIPE) or another error: stop forwarding.
+            // Discard the undelivered buffer WITHOUT crediting it (no silent
+            // "looks successful" input loss) and tell the host the child's stdin
+            // is gone so its relay terminates and pending/future writes fail
+            // loudly instead of waiting on credit that will never be granted.
+            unsafe { libc::close(entry.stdin_fd) };
+            entry.stdin_fd = -1;
+            entry.stdin_buf.clear();
+            send_guest_message(console, &GuestMessage::StdinClosed { id: id.to_string() });
             break;
         }
-        written += n as usize;
+        if n == 0 {
+            break;
+        }
+        entry.stdin_buf.drain(..n as usize);
+        entry.credit_pending += n as usize;
+    }
+
+    if entry.credit_pending >= CREDIT_GRANT_THRESHOLD {
+        let grant = entry.credit_pending;
+        entry.credit_pending = 0;
+        send_guest_message(
+            console,
+            &GuestMessage::StdinCredit {
+                id: id.to_string(),
+                bytes: grant,
+            },
+        );
+    }
+
+    // Honour a pending EOF once the buffer is fully drained.
+    if entry.stdin_eof_pending && entry.stdin_buf.is_empty() && entry.stdin_fd >= 0 {
+        unsafe { libc::close(entry.stdin_fd) };
+        entry.stdin_fd = -1;
     }
 }
 
@@ -303,8 +434,18 @@ fn finish_done_entries(execs: &mut HashMap<String, ExecEntry>, console: &Console
         if let Some(entry) = execs.remove(&id) {
             // Kill any background processes in the group that outlived the leader.
             unsafe { libc::kill(-(entry.pid), libc::SIGKILL) };
-            let code = entry.exit_code.unwrap_or(-1);
-            send_guest_message(console, &GuestMessage::Exit { id, code });
+            // A captured pre-exec failure is the terminal (it suppresses the
+            // numeric exit); otherwise emit the numeric exit. Exactly one
+            // terminal frame either way.
+            match entry.start_error() {
+                Some(message) => {
+                    send_guest_message(console, &GuestMessage::StartError { id, message });
+                }
+                None => {
+                    let code = entry.exit_code.unwrap_or(-1);
+                    send_guest_message(console, &GuestMessage::Exit { id, code });
+                }
+            }
         }
     }
 }
