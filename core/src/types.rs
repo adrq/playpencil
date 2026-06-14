@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::lifecycle::{DesiredState, FailureReason, State};
 
 // The exec wire protocol, flow-control constants, command-interpretation mode,
-// and the shared ExecHandle type family now live in `playpencil_exec`. Re-export
+// and the shared ExecHandle type family now live in `pipemux`. Re-export
 // the pieces here so the long-standing `core::types::*` paths (used across core,
 // the server faces, and the C ABI) keep resolving.
-pub use playpencil_exec::handle::{
+pub use pipemux::handle::{
     ExecCanceller, ExecControl, ExecEvent, ExecHandle, ExecId, ExecIo, ExecRequest,
 };
-pub use playpencil_exec::protocol::ExecMode;
-pub use playpencil_exec::protocol::limits::STDIN_FRAME_RAW_MAX;
+pub use pipemux::protocol::ExecMode;
+pub use pipemux::protocol::limits::STDIN_FRAME_RAW_MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxId(pub String);

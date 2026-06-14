@@ -27,8 +27,8 @@ use crate::types::{
     EntrypointExit, ExecEvent, ExecHandle, ExecId, ExecIo, ExecMode, ExecRequest, MountConfig,
     NetworkPolicy, SandboxConfig, SandboxId, SandboxStatus, SandboxView, validate_entrypoint,
 };
-use playpencil_exec::protocol::{self, HostFrame};
-use playpencil_exec::relay::{ExecMuxHost, MuxError, spawn_mux};
+use pipemux::protocol::{self, HostFrame};
+use pipemux::relay::{ExecMuxHost, MuxError, spawn_mux};
 
 /// Per-sandbox map from sandbox id to its running VM's exec engine handle.
 /// Populated by the driver's `start`, removed when the VM stops, recovers a
@@ -1583,7 +1583,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Validation tests
     // -----------------------------------------------------------------------
-    // (base64 codec parity is owned by playpencil_exec::protocol golden tests.)
+    // (base64 codec parity is owned by pipemux::protocol golden tests.)
 
     #[test]
     fn test_validate_mounts_rejects_non_absolute_host() {

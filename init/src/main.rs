@@ -9,8 +9,8 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use console::{Console, find_and_open_exec_console, poll_and_read_line, write_line};
-use playpencil_exec::producer::{ExecMux, FdKind, FrameSink, Interest};
-use playpencil_exec::protocol::{GuestFrame, HostFrame};
+use pipemux::producer::{ExecMux, FdKind, FrameSink, Interest};
+use pipemux::protocol::{GuestFrame, HostFrame};
 
 /// Bridges emitted guest frames to the virtio-console. Serialization/write
 /// failures are swallowed (best-effort) so a console hiccup never stalls process

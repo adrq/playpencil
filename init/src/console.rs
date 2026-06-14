@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use playpencil_exec::protocol::limits::MAX_FRAME_BYTES;
+use pipemux::protocol::limits::MAX_FRAME_BYTES;
 
 use crate::Error;
 

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use playpencil_core::backend::SandboxBackendSend;
 use playpencil_core::types::{ExecCanceller, ExecEvent, ExecMode, ExecRequest, SandboxId};
 
-use playpencil_exec::consumer::{Utf8StreamDecoder, spawn_escalation};
+use pipemux::consumer::{Utf8StreamDecoder, spawn_escalation};
 
 use crate::api_types::{CommandDeleteParams, CommandRequest};
 use crate::error::ApiError;

@@ -26,7 +26,7 @@ use playpencil_core::types::{
     ExecEvent, ExecIo, ExecMode, ExecRequest, STDIN_FRAME_RAW_MAX, SandboxId,
 };
 
-use playpencil_exec::consumer::spawn_escalation;
+use pipemux::consumer::spawn_escalation;
 
 use crate::error::ApiError;
 use crate::state::AppState;
