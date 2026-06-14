@@ -22,6 +22,13 @@ ALPINE_IMAGE_BACKEND = (
 ALPINE_IMAGE_FFI = (
     "alpine@sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339"
 )
+# A minimal image that ships NO shell/coreutils (no `tail`), pinned by its
+# amd64 platform-manifest digest — used to prove image-independent idle mode
+# (init is injected regardless, so an idle box needs no image-provided binary).
+DISTROLESS_IMAGE = (
+    "gcr.io/distroless/static-debian12"
+    "@sha256:7d14daf425206f9e79b463e57226c1d6500a6b42f4923d5f0a9a413657f5774f"
+)
 
 # Shared, pre-extracted image cache. Override with PLAYPENCIL_TEST_IMAGE_CACHE.
 # This is an interim known location, not a blessed production path.

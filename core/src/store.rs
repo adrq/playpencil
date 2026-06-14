@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::{DesiredState, FailureReason, State};
-use crate::types::{SandboxConfig, SandboxId};
+use crate::types::{EntrypointExit, SandboxConfig, SandboxId, validate_entrypoint};
 
 /// A single sandbox's durable record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +28,10 @@ pub struct PersistedRecord {
     pub rootfs_path: Option<PathBuf>,
     pub reason: Option<FailureReason>,
     pub message: Option<String>,
+    /// How the main process finished. Backend-internal; never reaches the status
+    /// wire. Valid only on a crashed-failed record (see `validate_record`).
+    #[serde(default)]
+    pub entrypoint_exit: Option<EntrypointExit>,
     pub created_at: String,
     pub last_transition_at: String,
 }
@@ -413,6 +417,16 @@ fn validate_record(map_key: &str, r: &PersistedRecord) -> Result<(), String> {
     if r.pid.is_some() != (r.state == Some(State::Running)) {
         return Err("pid present iff state is Running".into());
     }
+    // The main-process exit carrier is valid only on a crashed-failed record;
+    // any other state carrying it is a missed clear and corrupt. This is the
+    // loud structural backstop for the carrier invariant.
+    if r.entrypoint_exit.is_some()
+        && !(r.state == Some(State::Failed) && r.reason == Some(FailureReason::Crashed))
+    {
+        return Err("entrypoint_exit present only on failed+crashed records".into());
+    }
+    // A corrupt persisted main-process command must fail loud at load/write.
+    validate_entrypoint(r.config.entrypoint.as_deref())?;
 
     let obs = r.observed_generation;
     let cur_gen = r.generation;
@@ -539,6 +553,7 @@ mod tests {
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
+            entrypoint: None,
         }
     }
 
@@ -556,6 +571,7 @@ mod tests {
             rootfs_path: Some(PathBuf::from("/tmp/rootfs")),
             reason: None,
             message: None,
+            entrypoint_exit: None,
             created_at: "t0".into(),
             last_transition_at: "t0".into(),
         }
@@ -1065,6 +1081,106 @@ mod tests {
             rootfs_path: Some(PathBuf::from("/tmp/rootfs")),
             ..failed("sb-1", FailureReason::ProvisionFailed)
         });
+    }
+
+    // --- Entrypoint-exit carrier invariant -------------------------------
+
+    fn with_carrier(r: PersistedRecord) -> PersistedRecord {
+        PersistedRecord {
+            entrypoint_exit: Some(EntrypointExit::Exited { code: 7 }),
+            ..r
+        }
+    }
+
+    /// A latched, valid `Failed(reason)` with `desired = Running` (the shape the
+    /// crash/start-failure commits produce). `crashed`/`start_failed` carry a
+    /// rootfs; `provision_failed` does not.
+    fn failed_running(id: &str, reason: FailureReason) -> PersistedRecord {
+        PersistedRecord {
+            state: Some(State::Failed),
+            desired: DesiredState::Running,
+            reason: Some(reason),
+            message: Some("boom".into()),
+            rootfs_path: if reason == FailureReason::ProvisionFailed {
+                None
+            } else {
+                Some(PathBuf::from("/tmp/rootfs"))
+            },
+            ..base(id)
+        }
+    }
+
+    #[test]
+    fn carrier_valid_only_on_failed_crashed() {
+        // Failed(Crashed) with or without the carrier is valid.
+        ok(&with_carrier(failed_running(
+            "sb-1",
+            FailureReason::Crashed,
+        )));
+        ok(&failed_running("sb-1", FailureReason::Crashed));
+        // Every other state carrying the carrier is corrupt — on records that are
+        // otherwise valid, so the carrier rule is what rejects them.
+        bad(&with_carrier(base("sb-1"))); // Stopped
+        bad(&with_carrier(running("sb-1"))); // Running
+        bad(&with_carrier(failed_running(
+            "sb-1",
+            FailureReason::StartFailed,
+        )));
+        bad(&with_carrier(failed_running(
+            "sb-1",
+            FailureReason::ProvisionFailed,
+        )));
+        bad(&with_carrier(PersistedRecord {
+            desired: DesiredState::Destroyed,
+            ..failed("sb-1", FailureReason::DestroyFailed)
+        }));
+        bad(&with_carrier(PersistedRecord {
+            state: Some(State::Destroyed),
+            desired: DesiredState::Destroyed,
+            rootfs_path: None,
+            ..base("sb-1")
+        }));
+    }
+
+    #[test]
+    fn json_store_roundtrips_crashed_carrier() {
+        let dir = tempdir();
+        let store = JsonStore::new(dir.join("state.json"));
+        let rec = with_carrier(failed_running("sb-1", FailureReason::Crashed));
+        store.upsert(&rec).unwrap();
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].entrypoint_exit,
+            Some(EntrypointExit::Exited { code: 7 })
+        );
+    }
+
+    #[test]
+    fn upsert_rejects_carrier_on_non_crashed_record() {
+        // The store-level structural backstop: a deliberately missed clear-site
+        // (here an otherwise-valid Failed(StartFailed) carrying the carrier) fails
+        // loud at upsert, never silently persisted.
+        let store = InMemoryStore::new();
+        let invalid = with_carrier(failed_running("sb-1", FailureReason::StartFailed));
+        assert!(store.upsert(&invalid).is_err());
+        assert!(store.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_record_rejects_corrupt_persisted_entrypoint() {
+        // A malformed persisted main-process command fails loud at the store, so
+        // a corrupt record never reconciles into a boot.
+        let mut r = base("sb-1");
+        r.config.entrypoint = Some(vec![]);
+        bad(&r);
+        r.config.entrypoint = Some(vec![String::new()]);
+        bad(&r);
+        r.config.entrypoint = Some(vec!["bad\0arg".into()]);
+        bad(&r);
+        // A well-formed command is accepted.
+        r.config.entrypoint = Some(vec!["/bin/true".into()]);
+        ok(&r);
     }
 
     #[test]

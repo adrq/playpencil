@@ -11,6 +11,7 @@ Compute isolation layer. Cross-platform VM sandbox for running untrusted code (L
 ```bash
 make all        # Build everything (release)
 make check      # cargo check + clippy
+make check-exec-features  # Build playpencil-exec under every feature combo + assert dep-graph exclusions
 make test       # Run all tests (cargo + pytest, needs KVM)
 make test-rust  # Rust unit tests only
 make test-vm    # VM tests only (needs KVM)
@@ -23,10 +24,11 @@ Always use these `make` targets rather than invoking `cargo` directly: they set 
 
 ## Project Structure
 
-- **core/** — Core library crate (`playpencil-core`: lifecycle, policy, backends, network backend, C ABI)
-- **server/** — HTTP server crate (`playpencil-server`: OpenSandbox protocol, daemon runtime)
+- **exec/** — Exec / process-mux capability crate (`playpencil-exec`): the wire `protocol` (always on) plus the `producer` / `relay` / `consumer` capabilities behind Cargo features. See its crate-level docs (`exec/src/lib.rs`) for the four-capability model and the producer-must-not-use-tokio firewall.
+- **core/** — Core library crate (`playpencil-core`: lifecycle, policy, backends, network backend, C ABI). The libkrun backend is a thin adapter over `playpencil-exec`'s relay engine.
+- **server/** — HTTP server crate (`playpencil-server`: OpenSandbox protocol, daemon runtime). The SSE/WS exec faces drive `playpencil-exec`'s consumer-edge helpers.
 - **cli/** — CLI binary crate (`playpencil-cli`: serve + client subcommands)
-- **init/** — Guest init binary (`playpencil-init`: PID 1 inside VMs, exec handler). Built as musl static.
+- **init/** — Guest init binary (`playpencil-init`: PID 1 inside VMs, exec handler over `playpencil-exec`'s producer). Built as musl static.
 - **tests/** — Integration tests (Python)
 - **scripts/** — Build/publish/e2e
 

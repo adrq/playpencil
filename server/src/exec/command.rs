@@ -18,10 +18,10 @@ use tokio_util::sync::CancellationToken;
 use playpencil_core::backend::SandboxBackendSend;
 use playpencil_core::types::{ExecCanceller, ExecEvent, ExecMode, ExecRequest, SandboxId};
 
+use playpencil_exec::consumer::{Utf8StreamDecoder, spawn_escalation};
+
 use crate::api_types::{CommandDeleteParams, CommandRequest};
 use crate::error::ApiError;
-use crate::exec::decode::Utf8StreamDecoder;
-use crate::exec::spawn_escalation;
 use crate::state::{AppState, LiveControl};
 
 /// Bound on the SSE body channel: ties the credit-release boundary to consumer
@@ -430,6 +430,7 @@ mod tests {
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
+            entrypoint: None,
         }
     }
 

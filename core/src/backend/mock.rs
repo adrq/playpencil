@@ -5,14 +5,15 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use crate::lifecycle::{DesiredState, Verb};
 use crate::store::{InMemoryStore, PersistedRecord};
 use crate::types::{
-    ExecHandle, ExecId, ExecRequest, NoopBackchannel, SandboxConfig, SandboxId, SandboxStatus,
-    SandboxView,
+    EntrypointExit, ExecHandle, ExecId, ExecRequest, SandboxConfig, SandboxId, SandboxStatus,
+    SandboxView, validate_entrypoint,
 };
 
 use super::reconciler::{
-    DriverFactory, ReconcileRuntime, RootfsHandleExt, RunningVmHandle, VmDriverSend,
+    DriverFactory, EntrypointExitSink, ReconcileRuntime, RootfsHandleExt, RunningVmHandle,
+    VmDriverSend,
 };
-use super::{BackendError, Capabilities, SandboxBackendSend};
+use super::{BackendError, Capabilities, OutputSnapshot, SandboxBackendSend};
 
 /// In-memory driver: provisioning and VM lifecycle are instant no-ops, with a
 /// flippable liveness flag for crash simulation.
@@ -68,6 +69,7 @@ impl VmDriverSend for MockDriver {
         &mut self,
         _cfg: &SandboxConfig,
         _rootfs: &Self::RootfsHandle,
+        _entrypoint_exit: EntrypointExitSink,
     ) -> Result<Self::RunningVm, BackendError> {
         Ok(MockRunningVm {
             pid: self.pid_counter.fetch_add(1, Ordering::Relaxed),
@@ -78,6 +80,10 @@ impl VmDriverSend for MockDriver {
     }
 
     async fn stop(&mut self, _vm: Self::RunningVm) {}
+
+    async fn graceful_shutdown(&self, vm: &mut Self::RunningVm) {
+        vm.alive.store(false, Ordering::Release);
+    }
 
     async fn teardown(
         &mut self,
@@ -154,10 +160,12 @@ impl Drop for MockBackend {
 
 impl SandboxBackendSend for MockBackend {
     async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
+        validate_entrypoint(config.entrypoint.as_deref()).map_err(BackendError::InvalidInput)?;
         self.runtime.create(config, DesiredState::Stopped).await
     }
 
     async fn create_and_start(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
+        validate_entrypoint(config.entrypoint.as_deref()).map_err(BackendError::InvalidInput)?;
         self.runtime.create(config, DesiredState::Running).await
     }
 
@@ -189,22 +197,26 @@ impl SandboxBackendSend for MockBackend {
             return Err(BackendError::InvalidState);
         }
         let n = self.next_exec.fetch_add(1, Ordering::Relaxed);
-        let exec_id = ExecId(format!("exec-{n}"));
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::channel(64);
-        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(16);
-        drop(events_tx);
-        Ok(ExecHandle {
-            exec_id,
-            events: events_rx,
-            io: crate::types::ExecIo {
-                stdin: stdin_tx,
-                control: ctrl_tx,
-                backchannel: std::sync::Arc::new(NoopBackchannel),
-                stdin_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                stdin_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            },
-        })
+        // A handle with an already-closed event stream and stdin/control going
+        // nowhere — the mock runs no real process.
+        Ok(ExecHandle::for_mock(ExecId(format!("exec-{n}"))))
+    }
+
+    async fn entrypoint_exit(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Option<EntrypointExit>, BackendError> {
+        self.runtime.entrypoint_exit(id)
+    }
+
+    async fn entrypoint_output(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Option<OutputSnapshot>, BackendError> {
+        // The mock runs no real process, so there is no captured output. Resolve
+        // the sandbox first so an unknown id is still NotFound.
+        self.runtime.status(id)?;
+        Ok(None)
     }
 
     async fn list(&self) -> Result<Vec<SandboxView>, BackendError> {
@@ -245,6 +257,7 @@ mod tests {
             mounts: vec![],
             network: crate::types::NetworkPolicy::Isolated,
             env: vec![],
+            entrypoint: None,
         }
     }
 

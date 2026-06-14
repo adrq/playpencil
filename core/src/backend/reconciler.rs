@@ -20,7 +20,7 @@ use crate::lifecycle::{
     DesiredState, FailureReason, ReconcileAction, State, Verb, next_action, precondition_ok,
 };
 use crate::store::{PersistedRecord, Store, verify_pid};
-use crate::types::{SandboxConfig, SandboxId, SandboxStatus, SandboxView};
+use crate::types::{EntrypointExit, SandboxConfig, SandboxId, SandboxStatus, SandboxView};
 
 /// How often an idle actor re-checks VM liveness.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -86,11 +86,18 @@ pub trait VmDriver {
         &mut self,
         cfg: &SandboxConfig,
         rootfs: &Self::RootfsHandle,
+        entrypoint_exit: EntrypointExitSink,
     ) -> Result<Self::RunningVm, BackendError>;
     /// Running -> Stopped: kill the VM and free run-scoped resources.
     /// Infallible / best-effort (the liveness observer and reaper backstop the
     /// kill), so it consumes the handle and returns nothing.
     async fn stop(&mut self, vm: Self::RunningVm);
+    /// Bring a running VM down gracefully, BORROWING it so the caller can retain
+    /// the handle until the liveness observer commits the terminal state. Closes
+    /// the guest console so the guest flushes and self-exits, waits a bounded time
+    /// for that, and only then kills as a backstop. Used by the main-process-exit
+    /// coupling (borrow + retain) and by teardown (then consume).
+    async fn graceful_shutdown(&self, vm: &mut Self::RunningVm);
     /// Teardown to Destroyed: kill the VM (if any) and delete the rootfs with
     /// bounded retry. On persistent rootfs-delete failure, returns the rootfs
     /// handle back so the destroy can be re-asserted.
@@ -120,12 +127,50 @@ pub trait DriverFactory: Send + Sync + 'static {
 // Shared per-sandbox handles
 // ---------------------------------------------------------------------------
 
-enum ReconcileCommand {
+pub(crate) enum ReconcileCommand {
     SetDesired {
         verb: Verb,
         desired: DesiredState,
         ack: oneshot::Sender<Result<(), BackendError>>,
     },
+    /// The sandbox's main process terminated. Fire-and-forget (no ack); the actor
+    /// stashes the outcome and couples the VM down on its next reconcile.
+    EntrypointExited { outcome: EntrypointExit },
+}
+
+/// A narrow, cloneable channel the VM driver uses to report that the sandbox's
+/// main process has terminated, routed onto the sandbox's own command queue so
+/// the single-writer actor handles it serially with every other transition.
+#[derive(Clone)]
+pub struct EntrypointExitSink(mpsc::Sender<ReconcileCommand>);
+
+impl EntrypointExitSink {
+    /// Report the main process's outcome. Best-effort: a closed channel means the
+    /// actor is already gone, so there is nothing to couple.
+    pub async fn post(&self, outcome: EntrypointExit) {
+        let _ = self
+            .0
+            .send(ReconcileCommand::EntrypointExited { outcome })
+            .await;
+    }
+}
+
+#[cfg(test)]
+impl EntrypointExitSink {
+    /// A sink plus its receiving end, so a test can assert what was posted.
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<ReconcileCommand>) {
+        let (tx, rx) = mpsc::channel(8);
+        (Self(tx), rx)
+    }
+}
+
+/// Extract a posted main-process outcome from a reconcile command (test helper).
+#[cfg(test)]
+pub(crate) fn entrypoint_exited_outcome(cmd: ReconcileCommand) -> Option<EntrypointExit> {
+    match cmd {
+        ReconcileCommand::EntrypointExited { outcome } => Some(outcome),
+        ReconcileCommand::SetDesired { .. } => None,
+    }
 }
 
 /// The read-side handles published for one sandbox. Holds no live resources and
@@ -134,6 +179,10 @@ struct SharedEntry {
     cmd_tx: mpsc::Sender<ReconcileCommand>,
     view_rx: watch::Receiver<SandboxView>,
     events_tx: broadcast::Sender<SandboxStatus>,
+    /// The backend-only main-process exit carrier, seeded from the persisted
+    /// record and updated on every carrier-affecting commit. Distinct from
+    /// `view_rx` so the carrier never reaches the wire projection.
+    entrypoint_exit_rx: watch::Receiver<Option<EntrypointExit>>,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -225,18 +274,22 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
             rootfs_path: None,
             reason: None,
             message: None,
+            entrypoint_exit: None,
             created_at: now.clone(),
             last_transition_at: now,
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (view_tx, view_rx) = watch::channel(view_of(&record));
+        let (entrypoint_exit_tx, entrypoint_exit_rx) =
+            watch::channel(record.entrypoint_exit.clone());
         let (events_tx, _) = broadcast::channel(64);
         let poisoned = Arc::new(AtomicBool::new(false));
         let entry = SharedEntry {
-            cmd_tx,
+            cmd_tx: cmd_tx.clone(),
             view_rx,
             events_tx: events_tx.clone(),
+            entrypoint_exit_rx,
             poisoned: poisoned.clone(),
         };
 
@@ -246,10 +299,14 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
             running_vm: None,
             rootfs: None,
             pending_rollback: None,
+            pending_entrypoint_exit: None,
+            entrypoint_coupling: false,
             driver,
             store: self.store.clone(),
             cmd_rx,
+            self_cmd_tx: cmd_tx,
             view_tx,
+            entrypoint_exit_tx,
             events_tx,
             poisoned,
             map: self.map.clone(),
@@ -312,6 +369,18 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
             .filter(|e| !e.poisoned.load(Ordering::Acquire))
             .map(|e| e.view_rx.borrow().clone())
             .collect()
+    }
+
+    /// The backend-only main-process exit carrier for one sandbox, read off the
+    /// per-sandbox watch channel (seeded from the persisted record). Backend
+    /// implementations delegate here so the read path is backend-agnostic.
+    pub fn entrypoint_exit(&self, id: &SandboxId) -> Result<Option<EntrypointExit>, BackendError> {
+        let map = self.map.read().unwrap();
+        let entry = map.get(id).ok_or(BackendError::NotFound)?;
+        if entry.poisoned.load(Ordering::Acquire) {
+            return Err(BackendError::Internal("sandbox actor poisoned".into()));
+        }
+        Ok(entry.entrypoint_exit_rx.borrow().clone())
     }
 
     pub fn subscribe(
@@ -410,6 +479,7 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
                 record.pid_start_time = None;
                 record.reason = None;
                 record.message = None;
+                record.entrypoint_exit = None;
                 record.observed_generation = 0;
                 record.last_transition_at = rfc3339_now();
                 true
@@ -435,12 +505,15 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
         for (record, driver, rootfs) in prepared {
             let (cmd_tx, cmd_rx) = mpsc::channel(16);
             let (view_tx, view_rx) = watch::channel(view_of(&record));
+            let (entrypoint_exit_tx, entrypoint_exit_rx) =
+                watch::channel(record.entrypoint_exit.clone());
             let (events_tx, _) = broadcast::channel(64);
             let poisoned = Arc::new(AtomicBool::new(false));
             let entry = SharedEntry {
-                cmd_tx,
+                cmd_tx: cmd_tx.clone(),
                 view_rx,
                 events_tx: events_tx.clone(),
+                entrypoint_exit_rx,
                 poisoned: poisoned.clone(),
             };
             self.map.write().unwrap().insert(record.id.clone(), entry);
@@ -450,10 +523,14 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
                 running_vm: None,
                 rootfs,
                 pending_rollback: None,
+                pending_entrypoint_exit: None,
+                entrypoint_coupling: false,
                 driver,
                 store: self.store.clone(),
                 cmd_rx,
+                self_cmd_tx: cmd_tx,
                 view_tx,
+                entrypoint_exit_tx,
                 events_tx,
                 poisoned,
                 map: self.map.clone(),
@@ -480,10 +557,24 @@ struct Actor<D: VmDriverSend> {
     rootfs: Option<D::RootfsHandle>,
     /// A rootfs whose rollback cleanup keeps failing; retried each tick.
     pending_rollback: Option<D::RootfsHandle>,
+    /// A main-process exit awaiting coupling. Held in memory only (never
+    /// persisted) until the final terminal commit takes it; discarded if a
+    /// stop/destroy supersedes.
+    pending_entrypoint_exit: Option<EntrypointExit>,
+    /// Set when the apply step has run the graceful-shutdown coupling for a
+    /// stashed exit (the VM was still alive when the host applied it — the
+    /// real-exit signature). Gates whether the following crash commit carries the
+    /// outcome, so a spontaneous crash whose synthetic terminal raced ahead never
+    /// manufactures a carrier.
+    entrypoint_coupling: bool,
     driver: D,
     store: Arc<dyn Store>,
     cmd_rx: mpsc::Receiver<ReconcileCommand>,
+    /// A clone of this sandbox's command sender, used to build the
+    /// `EntrypointExitSink` handed to each `start`.
+    self_cmd_tx: mpsc::Sender<ReconcileCommand>,
     view_tx: watch::Sender<SandboxView>,
+    entrypoint_exit_tx: watch::Sender<Option<EntrypointExit>>,
     events_tx: broadcast::Sender<SandboxStatus>,
     poisoned: Arc<AtomicBool>,
     map: SharedMap,
@@ -509,7 +600,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 .write()
                 .unwrap()
                 .insert(self.record.id.clone(), entry);
-            let _ = self.view_tx.send(self.view());
+            self.publish_view();
             let _ = ack.send(Ok(()));
         }
 
@@ -557,10 +648,19 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
         view_of(&self.record).status
     }
 
+    /// Publish the view (wire-facing) and the backend-only exit carrier together,
+    /// keeping both watch channels in sync with the committed record.
+    fn publish_view(&self) {
+        let _ = self.view_tx.send(self.view());
+        let _ = self
+            .entrypoint_exit_tx
+            .send(self.record.entrypoint_exit.clone());
+    }
+
     /// Fsync the record then publish the view. Use for a committed transition.
     async fn commit(&mut self) -> io::Result<()> {
         persist_record(self.store.clone(), self.record.clone()).await?;
-        let _ = self.view_tx.send(self.view());
+        self.publish_view();
         Ok(())
     }
 
@@ -575,7 +675,14 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
     /// Validate, bump generation, fsync, then publish + ack — in that order, so
     /// a reader never observes non-durable intent.
     async fn accept_command(&mut self, cmd: ReconcileCommand) {
-        accept_command_into(&mut self.record, &self.store, &self.view_tx, cmd).await;
+        accept_command_into(
+            &mut self.record,
+            &self.store,
+            &self.view_tx,
+            &mut self.pending_entrypoint_exit,
+            cmd,
+        )
+        .await;
     }
 
     async fn drain_commands(&mut self) {
@@ -592,6 +699,11 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
             self.observe_liveness().await;
             if self.poisoned.load(Ordering::Acquire) {
                 return;
+            }
+            // A stashed main-process exit couples the VM down here; re-loop so the
+            // following observe_liveness commits the terminal + carrier.
+            if self.couple_pending_entrypoint_exit().await {
+                continue;
             }
             let attempted_gen = self.record.generation;
             let action = next_action(
@@ -629,6 +741,37 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
         }
     }
 
+    /// If a main-process exit is stashed and the VM is still running as intended,
+    /// bring it down gracefully (command-live, so a concurrent stop/destroy is
+    /// still accepted) and retain the handle. Returns true if it ran the coupling,
+    /// so the caller re-loops and the following `observe_liveness` commits the
+    /// terminal state and writes the carrier.
+    async fn couple_pending_entrypoint_exit(&mut self) -> bool {
+        if self.pending_entrypoint_exit.is_none()
+            || self.record.state != Some(State::Running)
+            || self.record.desired != DesiredState::Running
+            || self.running_vm.is_none()
+        {
+            return false;
+        }
+        // Latch the coupling so the crash commit carries the outcome (the VM was
+        // alive when we applied the exit — the real-exit signature).
+        self.entrypoint_coupling = true;
+        let vm = self.running_vm.as_mut().expect("running_vm checked above");
+        let fut = self.driver.graceful_shutdown(vm);
+        drive_action(
+            &mut self.cmd_rx,
+            &mut self.record,
+            &self.store,
+            &self.view_tx,
+            &mut self.pending_entrypoint_exit,
+            &self.shutdown,
+            fut,
+        )
+        .await;
+        true
+    }
+
     /// A `Running` VM that died: release resources and transition by intent.
     async fn observe_liveness(&mut self) {
         if self.record.state != Some(State::Running) {
@@ -645,17 +788,30 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
         self.record.pid = None;
         self.record.pid_start_time = None;
         self.record.last_transition_at = rfc3339_now();
+        // A coupled main-process exit carries its outcome onto the crash commit;
+        // an uncoupled death (a spontaneous crash, whose synthetic terminal may
+        // have raced a stash in ahead of us) settles plain crashed with no
+        // carrier. Either way the in-memory stash is discarded here.
+        let coupled_outcome = if self.entrypoint_coupling {
+            self.pending_entrypoint_exit.take()
+        } else {
+            None
+        };
+        self.pending_entrypoint_exit = None;
+        self.entrypoint_coupling = false;
         match self.record.desired {
             DesiredState::Running => {
                 self.record.state = Some(State::Failed);
                 self.record.reason = Some(FailureReason::Crashed);
                 self.record.message = Some("vm exited unexpectedly".into());
+                self.record.entrypoint_exit = coupled_outcome;
                 self.record.observed_generation = self.record.generation;
             }
             DesiredState::Stopped => {
                 self.record.state = Some(State::Stopped);
                 self.record.reason = None;
                 self.record.message = None;
+                self.record.entrypoint_exit = None;
                 self.record.observed_generation = self.record.generation;
             }
             // Never persist a pid-less Running: commit Stopped first, keep the
@@ -664,6 +820,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 self.record.state = Some(State::Stopped);
                 self.record.reason = None;
                 self.record.message = None;
+                self.record.entrypoint_exit = None;
             }
         }
         if self.commit().await.is_err() {
@@ -682,6 +839,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 &mut self.record,
                 &self.store,
                 &self.view_tx,
+                &mut self.pending_entrypoint_exit,
                 &self.shutdown,
                 fut,
             )
@@ -697,11 +855,12 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 self.record.rootfs_path = Some(rootfs.rootfs_path().to_path_buf());
                 self.record.reason = None;
                 self.record.message = None;
+                self.record.entrypoint_exit = None;
                 self.record.last_transition_at = rfc3339_now();
                 match persist_record(self.store.clone(), self.record.clone()).await {
                     Ok(()) => {
                         self.rootfs = Some(rootfs);
-                        let _ = self.view_tx.send(self.view());
+                        self.publish_view();
                         self.broadcast();
                     }
                     Err(_) => {
@@ -718,6 +877,14 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
     }
 
     async fn do_start(&mut self, attempted_gen: u64) {
+        // A fresh run must never inherit a prior run's stashed exit. Any pending
+        // outcome reaching here belongs to an abandoned run (a start that failed,
+        // or a stop/destroy that superseded the coupling before it ran), so clear
+        // it before launching — only an exit produced by THIS run (stashed during
+        // the start below) can then couple it down.
+        self.pending_entrypoint_exit = None;
+        self.entrypoint_coupling = false;
+
         let cfg = self.record.config.clone();
         let Some(rootfs) = self.rootfs.as_ref() else {
             self.fail_or_discard(
@@ -729,12 +896,14 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
             return;
         };
         let outcome = {
-            let fut = self.driver.start(&cfg, rootfs);
+            let sink = EntrypointExitSink(self.self_cmd_tx.clone());
+            let fut = self.driver.start(&cfg, rootfs, sink);
             drive_action(
                 &mut self.cmd_rx,
                 &mut self.record,
                 &self.store,
                 &self.view_tx,
+                &mut self.pending_entrypoint_exit,
                 &self.shutdown,
                 fut,
             )
@@ -751,11 +920,12 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 self.record.pid_start_time = Some(vm.pid_start_time());
                 self.record.reason = None;
                 self.record.message = None;
+                self.record.entrypoint_exit = None;
                 self.record.last_transition_at = rfc3339_now();
                 match persist_record(self.store.clone(), self.record.clone()).await {
                     Ok(()) => {
                         self.running_vm = Some(vm);
-                        let _ = self.view_tx.send(self.view());
+                        self.publish_view();
                         self.broadcast();
                     }
                     Err(_) => {
@@ -781,6 +951,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 &mut self.record,
                 &self.store,
                 &self.view_tx,
+                &mut self.pending_entrypoint_exit,
                 &self.shutdown,
                 fut,
             )
@@ -795,6 +966,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
         self.record.pid_start_time = None;
         self.record.reason = None;
         self.record.message = None;
+        self.record.entrypoint_exit = None;
         self.record.last_transition_at = rfc3339_now();
         if self.commit().await.is_err() {
             self.poison();
@@ -813,6 +985,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 &mut self.record,
                 &self.store,
                 &self.view_tx,
+                &mut self.pending_entrypoint_exit,
                 &self.shutdown,
                 fut,
             )
@@ -830,6 +1003,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                 self.record.rootfs_path = None;
                 self.record.reason = None;
                 self.record.message = None;
+                self.record.entrypoint_exit = None;
                 self.record.last_transition_at = rfc3339_now();
                 if self.commit().await.is_err() {
                     self.poison();
@@ -847,6 +1021,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                     self.record.state = Some(State::Failed);
                     self.record.reason = Some(FailureReason::DestroyFailed);
                     self.record.message = Some(e.to_string());
+                    self.record.entrypoint_exit = None;
                     self.record.observed_generation = attempted_gen;
                     self.record.last_transition_at = rfc3339_now();
                     if self.commit().await.is_err() {
@@ -868,6 +1043,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
                     };
                     self.record.reason = None;
                     self.record.message = None;
+                    self.record.entrypoint_exit = None;
                     self.record.observed_generation = attempted_gen;
                     self.record.last_transition_at = rfc3339_now();
                     let _ = self.commit().await;
@@ -888,6 +1064,7 @@ impl<D: VmDriverSend + Send + 'static> Actor<D> {
             self.record.state = Some(State::Failed);
             self.record.reason = Some(reason);
             self.record.message = Some(e.to_string());
+            self.record.entrypoint_exit = None;
             self.record.observed_generation = attempted_gen;
             self.record.last_transition_at = rfc3339_now();
             if self.commit().await.is_err() {
@@ -981,6 +1158,11 @@ fn normalize_recovered(record: &mut PersistedRecord) -> bool {
     record.pid = None;
     record.pid_start_time = None;
     record.last_transition_at = rfc3339_now();
+    // A recovered Running record carries no observed exit (the VM was SIGKILLed
+    // on restart), so it normalizes to plain crashed/stopped with no carrier. A
+    // genuine Failed(Crashed)+Some record is not a Running record, so it is left
+    // untouched (this function only acts on Running) and its carrier is preserved.
+    record.entrypoint_exit = None;
     match record.desired {
         DesiredState::Running => {
             record.state = Some(State::Failed);
@@ -1010,9 +1192,21 @@ async fn accept_command_into(
     record: &mut PersistedRecord,
     store: &Arc<dyn Store>,
     view_tx: &watch::Sender<SandboxView>,
+    pending_entrypoint_exit: &mut Option<EntrypointExit>,
     cmd: ReconcileCommand,
 ) {
-    let ReconcileCommand::SetDesired { verb, desired, ack } = cmd;
+    let (verb, desired, ack) = match cmd {
+        ReconcileCommand::SetDesired { verb, desired, ack } => (verb, desired, ack),
+        ReconcileCommand::EntrypointExited { outcome } => {
+            // Only couple while the caller still wants the sandbox running; a
+            // stop/destroy that already flipped the intent wins, and a late exit
+            // is dropped (the box still reaches its terminal state).
+            if record.desired == DesiredState::Running {
+                *pending_entrypoint_exit = Some(outcome);
+            }
+            return;
+        }
+    };
     if ack.is_closed() {
         return;
     }
@@ -1043,11 +1237,13 @@ async fn accept_command_into(
 /// future is polled to completion — never restarted — and borrows only the
 /// driver, disjoint from the accept path, so the actor stays the sole
 /// sequential writer of the record.
+#[allow(clippy::too_many_arguments)]
 async fn drive_action<T>(
     cmd_rx: &mut mpsc::Receiver<ReconcileCommand>,
     record: &mut PersistedRecord,
     store: &Arc<dyn Store>,
     view_tx: &watch::Sender<SandboxView>,
+    pending_entrypoint_exit: &mut Option<EntrypointExit>,
     shutdown: &CancellationToken,
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
@@ -1058,7 +1254,9 @@ async fn drive_action<T>(
             out = &mut fut => return Some(out),
             _ = shutdown.cancelled() => return None,
             maybe = cmd_rx.recv(), if !closed => match maybe {
-                Some(cmd) => accept_command_into(record, store, view_tx, cmd).await,
+                Some(cmd) => {
+                    accept_command_into(record, store, view_tx, pending_entrypoint_exit, cmd).await
+                }
                 None => closed = true,
             },
         }
@@ -1085,6 +1283,7 @@ mod tests {
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
+            entrypoint: None,
         }
     }
 
@@ -1100,9 +1299,14 @@ mod tests {
         teardown_hold: Arc<AtomicBool>,
         rootfs_missing: Arc<AtomicBool>,
         alive: Arc<AtomicBool>,
+        graceful_hold: Arc<AtomicBool>,
         provisions: Arc<AtomicU64>,
         starts: Arc<AtomicU64>,
         teardowns: Arc<AtomicU64>,
+        graceful_shutdowns: Arc<AtomicU64>,
+        /// The most recent exit sink handed to `start`, so a test can post a
+        /// main-process exit into the actor.
+        entrypoint_sink: Arc<std::sync::Mutex<Option<EntrypointExitSink>>>,
         /// Sandbox ids whose `recover_rootfs` should fail (per-record recovery
         /// failure injection for the two-phase recovery test).
         recover_fail_ids: Arc<std::sync::Mutex<Vec<String>>>,
@@ -1166,8 +1370,10 @@ mod tests {
             &mut self,
             _cfg: &SandboxConfig,
             _rootfs: &TestRootfs,
+            sink: EntrypointExitSink,
         ) -> Result<TestVm, BackendError> {
             self.ctl.starts.fetch_add(1, Ordering::Relaxed);
+            *self.ctl.entrypoint_sink.lock().unwrap() = Some(sink);
             spin_while(&self.ctl.start_hold).await;
             if self.ctl.start_fail.load(Ordering::Acquire) {
                 return Err(BackendError::Internal("start".into()));
@@ -1181,6 +1387,14 @@ mod tests {
         }
 
         async fn stop(&mut self, _vm: TestVm) {}
+
+        async fn graceful_shutdown(&self, vm: &mut TestVm) {
+            self.ctl.graceful_shutdowns.fetch_add(1, Ordering::Relaxed);
+            spin_while(&self.ctl.graceful_hold).await;
+            // The controlled console-close makes the guest self-exit: the VM goes
+            // dead, which the following liveness observation commits.
+            vm.alive.store(false, Ordering::Release);
+        }
 
         async fn teardown(
             &mut self,
@@ -1475,6 +1689,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1533,6 +1748,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1577,6 +1793,7 @@ mod tests {
                 rootfs_path: None,
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now.clone(),
             })
@@ -1595,6 +1812,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1672,6 +1890,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1701,6 +1920,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1742,6 +1962,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1767,6 +1988,7 @@ mod tests {
                 rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -1810,7 +2032,13 @@ mod tests {
         });
         let rt = runtime(Ctl::default(), store.clone());
         let id = rt.create(cfg(), DesiredState::Stopped).await.unwrap();
-        let v = await_view(&rt, &id, |v| v.status.state == Some(State::Stopped)).await;
+        // Wait for full convergence (not just the first Stopped publish, which can
+        // precede the converge commit that latches observed == generation).
+        let v = await_view(&rt, &id, |v| {
+            v.status.state == Some(State::Stopped)
+                && v.status.observed_generation == v.status.generation
+        })
+        .await;
         assert_eq!(v.status.observed_generation, v.status.generation);
 
         // An accepted Start is acked Ok and its generation bump is NOT rolled
@@ -2037,6 +2265,7 @@ mod tests {
                 rootfs_path: None,
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -2078,6 +2307,7 @@ mod tests {
                 rootfs_path: None,
                 reason: None,
                 message: None,
+                entrypoint_exit: None,
                 created_at: now.clone(),
                 last_transition_at: now,
             })
@@ -2112,5 +2342,234 @@ mod tests {
             .await
             .unwrap();
         await_view(&rt, &id, |v| v.status.state == Some(State::Destroyed)).await;
+    }
+
+    // --- Main-process exit coupling --------------------------------------
+
+    /// Wait until `start` has handed the driver an exit sink, then return it.
+    async fn await_sink(ctl: &Ctl) -> EntrypointExitSink {
+        for _ in 0..400 {
+            if let Some(sink) = ctl.entrypoint_sink.lock().unwrap().clone() {
+                return sink;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("start never produced an exit sink");
+    }
+
+    #[tokio::test]
+    async fn entrypoint_exit_couples_to_failed_crashed_with_carrier() {
+        let ctl = Ctl::default();
+        let rt = runtime(ctl.clone(), Arc::new(InMemoryStore::new()));
+        let id = rt.create(cfg(), DesiredState::Running).await.unwrap();
+        await_view(&rt, &id, |v| v.status.state == Some(State::Running)).await;
+        // A real exit (the VM is still alive) couples the VM down and carries the
+        // outcome onto the terminal record.
+        await_sink(&ctl)
+            .await
+            .post(EntrypointExit::Exited { code: 5 })
+            .await;
+        let v = await_view(&rt, &id, |v| v.status.state == Some(State::Failed)).await;
+        assert_eq!(v.status.reason, Some(FailureReason::Crashed));
+        assert_eq!(
+            rt.entrypoint_exit(&id).unwrap(),
+            Some(EntrypointExit::Exited { code: 5 })
+        );
+        // The coupling ran the graceful primitive exactly to bring the VM down.
+        assert!(ctl.graceful_shutdowns.load(Ordering::Acquire) >= 1);
+    }
+
+    #[tokio::test]
+    async fn entrypoint_start_error_couples_with_start_error_carrier() {
+        let ctl = Ctl::default();
+        let rt = runtime(ctl.clone(), Arc::new(InMemoryStore::new()));
+        let id = rt.create(cfg(), DesiredState::Running).await.unwrap();
+        await_view(&rt, &id, |v| v.status.state == Some(State::Running)).await;
+        await_sink(&ctl)
+            .await
+            .post(EntrypointExit::StartError {
+                message: "no such file".into(),
+            })
+            .await;
+        await_view(&rt, &id, |v| v.status.state == Some(State::Failed)).await;
+        assert_eq!(
+            rt.entrypoint_exit(&id).unwrap(),
+            Some(EntrypointExit::StartError {
+                message: "no such file".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn spontaneous_crash_has_no_carrier() {
+        let ctl = Ctl::default();
+        let rt = runtime(ctl.clone(), Arc::new(InMemoryStore::new()));
+        let id = rt.create(cfg(), DesiredState::Running).await.unwrap();
+        await_view(&rt, &id, |v| v.status.state == Some(State::Running)).await;
+        let sink = await_sink(&ctl).await;
+        // A spontaneous crash: the VM is already dead AND a synthetic terminal
+        // posts (as the relay would on a crash). The coupling guard sees the VM
+        // was not coupled down, so the terminal carries no exit outcome.
+        ctl.alive.store(false, Ordering::Release);
+        sink.post(EntrypointExit::Exited { code: -1 }).await;
+        let v = await_view(&rt, &id, |v| v.status.state == Some(State::Failed)).await;
+        assert_eq!(v.status.reason, Some(FailureReason::Crashed));
+        assert_eq!(rt.entrypoint_exit(&id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn entrypoint_exit_mid_start_is_stashed_and_applied() {
+        let ctl = Ctl::default();
+        ctl.start_hold.store(true, Ordering::Release);
+        let rt = runtime(ctl.clone(), Arc::new(InMemoryStore::new()));
+        let id = rt.create(cfg(), DesiredState::Running).await.unwrap();
+        // The sink is published at the very top of start, before it blocks, so the
+        // exit arrives while start is still in flight (before Running commits).
+        let sink = await_sink(&ctl).await;
+        sink.post(EntrypointExit::Exited { code: 9 }).await;
+        ctl.start_hold.store(false, Ordering::Release);
+        // The stash is applied once Running settles, deterministically carrying it.
+        let v = await_view(&rt, &id, |v| v.status.state == Some(State::Failed)).await;
+        assert_eq!(v.status.reason, Some(FailureReason::Crashed));
+        assert_eq!(
+            rt.entrypoint_exit(&id).unwrap(),
+            Some(EntrypointExit::Exited { code: 9 })
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_during_graceful_converges_destroyed_without_carrier() {
+        let ctl = Ctl::default();
+        ctl.graceful_hold.store(true, Ordering::Release);
+        let rt = runtime(ctl.clone(), Arc::new(InMemoryStore::new()));
+        let id = rt.create(cfg(), DesiredState::Running).await.unwrap();
+        await_view(&rt, &id, |v| v.status.state == Some(State::Running)).await;
+        // The exit starts the coupling, which blocks inside the graceful primitive.
+        await_sink(&ctl)
+            .await
+            .post(EntrypointExit::Exited { code: 0 })
+            .await;
+        for _ in 0..400 {
+            if ctl.graceful_shutdowns.load(Ordering::Acquire) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A destroy arriving mid-graceful is accepted promptly (command-live), not
+        // blocked behind the in-flight graceful future.
+        let acked = tokio::time::timeout(
+            Duration::from_secs(2),
+            rt.set_desired(&id, Verb::Destroy, DesiredState::Destroyed),
+        )
+        .await;
+        assert!(
+            matches!(acked, Ok(Ok(()))),
+            "destroy must be accepted while graceful is in flight: {acked:?}"
+        );
+        // Once graceful completes, the box converges to Destroyed with no carrier.
+        ctl.graceful_hold.store(false, Ordering::Release);
+        await_view(&rt, &id, |v| v.status.state == Some(State::Destroyed)).await;
+        assert_eq!(rt.entrypoint_exit(&id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn recovered_crashed_carrier_is_visible_immediately() {
+        // A persisted Failed(Crashed)+Some record's carrier is seeded onto the
+        // seam at recovery, so it reads back without any further commit.
+        let store = Arc::new(InMemoryStore::new());
+        let now = rfc3339_now();
+        store
+            .upsert(&PersistedRecord {
+                id: SandboxId("sb-1".into()),
+                config: cfg(),
+                desired: DesiredState::Running,
+                generation: 2,
+                state: Some(State::Failed),
+                observed_generation: 2,
+                pid: None,
+                pid_start_time: None,
+                rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
+                reason: Some(FailureReason::Crashed),
+                message: Some("vm exited unexpectedly".into()),
+                entrypoint_exit: Some(EntrypointExit::Exited { code: 3 }),
+                created_at: now.clone(),
+                last_transition_at: now,
+            })
+            .unwrap();
+        let rt = recoverable_runtime(Ctl::default(), store);
+        rt.recover().await.unwrap();
+        assert_eq!(
+            rt.entrypoint_exit(&SandboxId("sb-1".into())).unwrap(),
+            Some(EntrypointExit::Exited { code: 3 })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_entrypoint_exit_does_not_couple_a_later_run() {
+        // An exit stashed during a doomed start must not survive to couple a LATER
+        // successful run down — a cross-run correctness hazard.
+        let ctl = Ctl::default();
+        ctl.start_fail.store(true, Ordering::Release);
+        ctl.start_hold.store(true, Ordering::Release);
+        let rt = runtime(ctl.clone(), Arc::new(InMemoryStore::new()));
+        let id = rt.create(cfg(), DesiredState::Running).await.unwrap();
+        // The sink is published at the top of start (before it blocks + fails), so
+        // the exit is stashed during this doomed run.
+        let sink = await_sink(&ctl).await;
+        sink.post(EntrypointExit::Exited { code: 1 }).await;
+        ctl.start_hold.store(false, Ordering::Release);
+        await_view(&rt, &id, |v| {
+            v.status.reason == Some(FailureReason::StartFailed)
+        })
+        .await;
+        // Reopen with a now-succeeding start: the stale exit must be discarded, so
+        // the fresh run reaches Running and STAYS there (never coupled down).
+        ctl.start_fail.store(false, Ordering::Release);
+        rt.set_desired(&id, Verb::Start, DesiredState::Running)
+            .await
+            .unwrap();
+        await_view(&rt, &id, |v| v.status.state == Some(State::Running)).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            rt.status(&id).unwrap().status.state,
+            Some(State::Running),
+            "a stale pending exit must not couple a later run down"
+        );
+        assert_eq!(rt.entrypoint_exit(&id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn recovery_self_heals_stale_carrier_when_accepted_start_runs() {
+        // A daemon crash AFTER a start was accepted (generation bumped, observed <
+        // generation) but BEFORE do_start ran leaves a valid
+        // Failed(Crashed)+desired=Running+Some record. The accept un-latched the
+        // box (observed != generation), so recovery boots it and the carrier is
+        // cleared at the Running state-write — the stale carrier does not persist
+        // indefinitely.
+        let store = Arc::new(InMemoryStore::new());
+        let now = rfc3339_now();
+        store
+            .upsert(&PersistedRecord {
+                id: SandboxId("sb-1".into()),
+                config: cfg(),
+                desired: DesiredState::Running,
+                generation: 3,
+                state: Some(State::Failed),
+                observed_generation: 2, // accepted start, not yet executed
+                pid: None,
+                pid_start_time: None,
+                rootfs_path: Some(std::env::temp_dir().join("pp-rec/rootfs")),
+                reason: Some(FailureReason::Crashed),
+                message: Some("vm exited unexpectedly".into()),
+                entrypoint_exit: Some(EntrypointExit::Exited { code: 9 }),
+                created_at: now.clone(),
+                last_transition_at: now,
+            })
+            .unwrap();
+        let rt = recoverable_runtime(Ctl::default(), store);
+        rt.recover().await.unwrap();
+        let id = SandboxId("sb-1".into());
+        await_view(&rt, &id, |v| v.status.state == Some(State::Running)).await;
+        assert_eq!(rt.entrypoint_exit(&id).unwrap(), None);
     }
 }

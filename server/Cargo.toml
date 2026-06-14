@@ -7,6 +7,7 @@ description = "Compute isolation layer — cross-platform VM sandbox for running
 
 [dependencies]
 playpencil-core = { path = "../core" }
+playpencil-exec = { path = "../exec", features = ["consumer"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

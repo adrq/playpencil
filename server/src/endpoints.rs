@@ -97,6 +97,7 @@ mod tests {
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
+            entrypoint: None,
         }
     }
 

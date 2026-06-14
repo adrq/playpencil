@@ -125,20 +125,21 @@ def _make_runtime_config(data_dir):
     ).encode("utf-8")
 
 
-def _sandbox_config(image=ALPINE_IMAGE_FFI):
-    return json.dumps(
-        {
-            "image": image,
-            "resource_limits": {
-                "cpus": 1,
-                "memory_bytes": 256 * 1024 * 1024,
-                "disk_bytes": None,
-            },
-            "mounts": [],
-            "network": "Isolated",
-            "env": [],
-        }
-    ).encode("utf-8")
+def _sandbox_config(image=ALPINE_IMAGE_FFI, entrypoint=None):
+    cfg = {
+        "image": image,
+        "resource_limits": {
+            "cpus": 1,
+            "memory_bytes": 256 * 1024 * 1024,
+            "disk_bytes": None,
+        },
+        "mounts": [],
+        "network": "Isolated",
+        "env": [],
+    }
+    if entrypoint is not None:
+        cfg["entrypoint"] = entrypoint
+    return json.dumps(cfg).encode("utf-8")
 
 
 @pytest.fixture
@@ -224,6 +225,36 @@ def test_ffi_exec_invalid_env_is_invalid_input(pplib, ffi_runtime):
     err = get_last_error(pplib)
     assert err is not None and "env key" in err, err
 
+    pplib.pp_sandbox_destroy(sb)
+    _wait_state(pplib, sb, "destroyed")
+    pplib.pp_sandbox_free(sb)
+
+
+def test_ffi_create_rejects_invalid_entrypoint(pplib, ffi_runtime):
+    """A malformed main-process command is rejected as invalid input at the
+    core/FFI boundary (an empty program), before any provisioning — the same
+    validation the HTTP path and the durable store enforce."""
+    sb = pplib.pp_sandbox_create(ffi_runtime, _sandbox_config(entrypoint=[""]))
+    assert sb is None, "create must reject an empty entrypoint program"
+    err = get_last_error(pplib)
+    assert err is not None and "entrypoint" in err, err
+
+
+@pytest.mark.vm
+def test_ffi_entrypoint_exit_reaches_terminal_without_leaking_carrier(
+    pplib, ffi_runtime
+):
+    """A create-supplied entrypoint runs as the main process; when it exits the VM
+    is driven to a terminal state. The exit carrier is backend-internal and must
+    NOT appear in the C-ABI status JSON."""
+    sb = pplib.pp_sandbox_create_and_start(
+        ffi_runtime, _sandbox_config(entrypoint=["sh", "-c", "exit 0"])
+    )
+    assert sb is not None, f"create failed: {get_last_error(pplib)}"
+    _wait_state(pplib, sb, "failed")
+    status_json = read_pp_string(pplib, pplib.pp_sandbox_status(sb))
+    assert "entrypoint_exit" not in status_json, status_json
+    assert "exit_code" not in status_json, status_json
     pplib.pp_sandbox_destroy(sb)
     _wait_state(pplib, sb, "destroyed")
     pplib.pp_sandbox_free(sb)

@@ -1,8 +1,13 @@
 pub mod libkrun;
 pub mod mock;
+pub mod output;
 pub mod reconciler;
 
-use crate::types::{ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus, SandboxView};
+pub use output::{OutputChunk, OutputSnapshot, OutputStream};
+
+use crate::types::{
+    EntrypointExit, ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus, SandboxView,
+};
 use std::fmt;
 
 #[derive(Debug)]
@@ -57,6 +62,17 @@ pub trait SandboxBackend {
     async fn status(&self, id: &SandboxId) -> Result<SandboxView, BackendError>;
     async fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecHandle, BackendError>;
     async fn list(&self) -> Result<Vec<SandboxView>, BackendError>;
+    /// How the sandbox's main process finished, if it has and the outcome is
+    /// retained. Backend-internal diagnostics, distinct from `status`.
+    async fn entrypoint_exit(&self, id: &SandboxId)
+    -> Result<Option<EntrypointExit>, BackendError>;
+    /// A decoded, full-retention snapshot of the main process's captured output.
+    /// `None` when the backend captures nothing (e.g. the mock) or no run has
+    /// produced output. Non-streaming.
+    async fn entrypoint_output(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Option<OutputSnapshot>, BackendError>;
     /// Subscribe to committed `state` transitions for one sandbox.
     fn subscribe(
         &self,

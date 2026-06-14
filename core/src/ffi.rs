@@ -123,10 +123,10 @@ impl From<&ExecEvent> for ExecEventDto {
     fn from(event: &ExecEvent) -> Self {
         match event {
             ExecEvent::Stdout(data) => Self::Stdout {
-                data: crate::util::base64_encode(data),
+                data: playpencil_exec::protocol::codec::base64_encode(data),
             },
             ExecEvent::Stderr(data) => Self::Stderr {
-                data: crate::util::base64_encode(data),
+                data: playpencil_exec::protocol::codec::base64_encode(data),
             },
             ExecEvent::StartError(message) => Self::StartError {
                 message: message.clone(),
@@ -764,7 +764,10 @@ mod tests {
         let json = exec_event_to_json(&event);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "stdout");
-        assert_eq!(v["data"], crate::util::base64_encode(b"hello"));
+        assert_eq!(
+            v["data"],
+            playpencil_exec::protocol::codec::base64_encode(b"hello")
+        );
     }
 
     #[test]

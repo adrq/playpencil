@@ -1,14 +1,43 @@
-//! Incremental UTF-8 decoding for the text command face.
+//! Consumer-edge helpers: the reusable pieces a protocol terminator needs that
+//! are NOT tied to a specific transport. The transports themselves (axum SSE,
+//! axum WS, the C ABI) stay in their environment edges and import these.
 //!
-//! Raw process bytes arrive in arbitrary chunks that may split a multi-byte
-//! codepoint. The decoder emits the longest valid text it can and carries the
-//! trailing incomplete bytes to the next push, so a split codepoint never
-//! produces a spurious replacement character. It also reports how many RAW
-//! process bytes each emission represents, which is the unit of output credit.
+//! - [`Utf8StreamDecoder`] — incremental UTF-8 decode that carries split
+//!   codepoints across pushes and reports the RAW byte count each emission
+//!   represents (the unit of output credit).
+//! - [`spawn_escalation`] — the single TERM→grace→KILL cancellation owner.
+
+use std::time::Duration;
+
+use crate::handle::ExecCanceller;
+use crate::{SIGKILL, SIGTERM};
+
+/// Grace between TERM and KILL when escalating a cancellation.
+pub const TERM_GRACE: Duration = Duration::from_secs(10);
+
+/// Spawn the single TERM→grace→KILL escalation owner for one exec. Backend
+/// cancellation is latched (the `cancel_phase` latch), so even if this races a
+/// concurrent caller the process still receives at most one resume + one TERM +
+/// one KILL. Callers must still coalesce to ONE escalation task per exec (via a
+/// `cleanup_started`/`take_for_cleanup` win) so a stray grace timer is not left
+/// running per disconnect.
+pub fn spawn_escalation(canceller: ExecCanceller) {
+    tokio::spawn(async move {
+        canceller.cancel(SIGTERM);
+        tokio::time::sleep(TERM_GRACE).await;
+        canceller.cancel(SIGKILL);
+    });
+}
 
 /// Per-stream incremental UTF-8 decoder (stdout and stderr decode separately).
+///
+/// Raw process bytes arrive in arbitrary chunks that may split a multi-byte
+/// codepoint. The decoder emits the longest valid text it can and carries the
+/// trailing incomplete bytes to the next push, so a split codepoint never
+/// produces a spurious replacement character. It also reports how many RAW
+/// process bytes each emission represents, which is the unit of output credit.
 #[derive(Default)]
-pub(crate) struct Utf8StreamDecoder {
+pub struct Utf8StreamDecoder {
     carry: Vec<u8>,
 }
 
@@ -40,8 +69,13 @@ impl Utf8StreamDecoder {
                 Err(e) => {
                     let valid = e.valid_up_to();
                     if valid > 0 {
-                        // SAFETY: `valid_up_to` is a guaranteed valid boundary.
-                        out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid]) });
+                        // `valid_up_to` is a guaranteed UTF-8 boundary, so this
+                        // checked conversion never fails (keeps the crate's
+                        // consumer/relay graphs unsafe-free).
+                        out.push_str(
+                            std::str::from_utf8(&rest[..valid])
+                                .expect("valid_up_to is a UTF-8 boundary"),
+                        );
                     }
                     match e.error_len() {
                         // Incomplete trailing sequence: hold it for the next push.

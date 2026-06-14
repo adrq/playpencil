@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ALPINE_IMAGE_BACKEND, seed_image_cache
+from conftest import ALPINE_IMAGE_BACKEND, DISTROLESS_IMAGE, seed_image_cache
 
 
 class WSConn:
@@ -187,7 +187,11 @@ def server(tmp_path):
             addr = line[len("listening on ") :]
             port = int(addr.rsplit(":", 1)[1])
 
-    yield SandboxClient("127.0.0.1", port)
+    client = SandboxClient("127.0.0.1", port)
+    # Expose the daemon pid so tests can enumerate the VM child processes it forks
+    # (each forked VM's parent is the daemon process).
+    client.daemon_pid = proc.pid
+    yield client
 
     proc.terminate()
     try:
@@ -217,22 +221,28 @@ class SandboxClient:
         return resp.status, None
 
     def create(
-        self, image=ALPINE_IMAGE_BACKEND, cpus=1, memory_mb=256, network="isolated"
+        self,
+        image=ALPINE_IMAGE_BACKEND,
+        cpus=1,
+        memory_mb=256,
+        network="isolated",
+        entrypoint=None,
+        env=None,
+        mounts=None,
     ):
-        status, body = self._request(
-            "POST",
-            "/v1/sandboxes",
-            {
-                "image": {"uri": image},
-                "resource_limits": {
-                    "cpus": cpus,
-                    "memory_bytes": memory_mb * 1024 * 1024,
-                },
-                "mounts": [],
-                "network": network,
-                "env": {},
+        body = {
+            "image": {"uri": image},
+            "resource_limits": {
+                "cpus": cpus,
+                "memory_bytes": memory_mb * 1024 * 1024,
             },
-        )
+            "mounts": mounts or [],
+            "network": network,
+            "env": env or {},
+        }
+        if entrypoint is not None:
+            body["entrypoint"] = entrypoint
+        status, body = self._request("POST", "/v1/sandboxes", body)
         assert status == 202, f"create failed: {status} {body}"
         return body["id"]
 
@@ -657,3 +667,231 @@ def test_duplex_not_running_sandbox_is_409_before_upgrade(server):
     resp = conn.getresponse()
     conn.close()
     assert resp.status == 409
+
+
+# ---------------------------------------------------------------------------
+# Boot-into-entrypoint
+# ---------------------------------------------------------------------------
+
+
+def test_entrypoint_exit_drives_terminal(server):
+    """A create-supplied entrypoint runs as the main process; when it exits the VM
+    lifetime tracks it and the sandbox reaches a terminal (Failed) state."""
+    sid = server.create(entrypoint=["sh", "-c", "exit 3"])
+    server.wait_state(sid, "Failed")
+    body = server.status(sid)
+    assert body["status"]["reason"] == "crashed"
+    server.destroy(sid)
+
+
+def test_entrypoint_carrier_not_on_status_wire(server):
+    """The backend-only exit carrier must never appear in the HTTP status/list
+    JSON — only the lifecycle state is exposed."""
+    sid = server.create(entrypoint=["sh", "-c", "exit 7"])
+    try:
+        server.wait_state(sid, "Failed")
+        raw = json.dumps(server.status(sid))
+        assert "entrypoint_exit" not in raw, raw
+        assert "exit_code" not in raw, raw
+        # The list projection is also clean.
+        _, listing = server._request("GET", "/v1/sandboxes")
+        assert "entrypoint_exit" not in json.dumps(listing)
+    finally:
+        server.destroy(sid)
+
+
+def test_idle_box_no_entrypoint_stays_running_and_execs(server):
+    """Omitting the entrypoint leaves the sandbox idle: it stays Running with no
+    main process, and caller execs still work."""
+    sid = server.create()  # no entrypoint
+    try:
+        server.wait_state(sid, "Running")
+        time.sleep(2)
+        assert server.status(sid)["status"]["state"] == "Running"
+        status, events = server.command(sid, "echo idle-ok")
+        assert status == 200
+        stdout = "".join(e.get("text", "") for e in events if e["type"] == "stdout")
+        assert stdout.strip() == "idle-ok"
+    finally:
+        server.destroy(sid)
+
+
+def test_image_independent_idle_box(server):
+    """An idle box (no entrypoint) reaches and stays Running on a MINIMAL image
+    that ships no shell/coreutils (no `tail`). This proves idle mode does not
+    depend on an image-provided keepalive binary: init is injected regardless and
+    serves the channel as PID 1, so a regression to an image-binary keepalive
+    would fail here (where no such binary exists)."""
+    sid = server.create(image=DISTROLESS_IMAGE)  # no entrypoint -> idle
+    try:
+        server.wait_state(sid, "Running")
+        time.sleep(2)
+        assert server.status(sid)["status"]["state"] == "Running"
+    finally:
+        server.destroy(sid)
+
+
+def test_create_invalid_entrypoint_is_422(server):
+    """A malformed entrypoint (empty program) is user-input rejected (422) before
+    any provisioning, mirroring the core validation."""
+    status, body = server._request(
+        "POST",
+        "/v1/sandboxes",
+        {
+            "image": {"uri": ALPINE_IMAGE_BACKEND},
+            "resource_limits": {"cpus": 1, "memory_bytes": 256 * 1024 * 1024},
+            "mounts": [],
+            "network": "isolated",
+            "env": {},
+            "entrypoint": [""],
+        },
+    )
+    assert status == 422, (status, body)
+    assert body["error"] == "validation_error"
+    assert "entrypoint" in body["detail"]
+
+
+def test_entrypoint_inherits_create_env_and_scrubs_reserved(server, tmp_path):
+    """The entrypoint inherits the create env plus the standard guest env, and no
+    reserved PLAYPENCIL_* variable leaks into it. The entrypoint writes its
+    environment through an rw mount so the result is observable on the host.
+
+    Uses UNRESTRICTED networking so init actually injects a real reserved variable
+    (PLAYPENCIL_NET_MODE=unrestricted) into its own environment before launching
+    the child — without this the scrub assertion would be vacuous (it would still
+    pass with the scrub removed). The child must NOT see that variable."""
+    shared = tmp_path / "envout"
+    shared.mkdir()
+    sid = server.create(
+        entrypoint=["sh", "-c", "env > /out/env.txt"],
+        env={"PP_BOOT_MARKER": "boot-value"},
+        mounts=[{"host_path": str(shared), "guest_path": "/out", "read_only": False}],
+        network="unrestricted",
+    )
+    try:
+        # The entrypoint runs then exits, coupling the VM down (Failed) after the
+        # controlled flush.
+        server.wait_state(sid, "Failed")
+        env_text = (shared / "env.txt").read_text()
+        assert "PP_BOOT_MARKER=boot-value" in env_text, env_text
+        assert "HOME=" in env_text
+        assert "PATH=" in env_text
+        assert "TERM=" in env_text
+        # PLAYPENCIL_NET_MODE was injected into init's environ for this run; the
+        # scrub must remove it (and every reserved var) before launching the child.
+        assert "PLAYPENCIL_NET_MODE" not in env_text, env_text
+        assert "PLAYPENCIL_" not in env_text, env_text
+    finally:
+        server.destroy(sid)
+
+
+def _decode_capture(path):
+    """Decode the internal entrypoint-capture.bin framing:
+    [stream:u8][len:u32-le][raw bytes]*, tolerating a truncated trailing record."""
+    data = path.read_bytes()
+    chunks = []
+    off = 0
+    while off + 5 <= len(data):
+        stream = data[off]
+        if stream not in (0, 1):
+            break
+        n = int.from_bytes(data[off + 1 : off + 5], "little")
+        start = off + 5
+        if start + n > len(data):
+            break
+        chunks.append((stream, data[start : start + n]))
+        off = start + n
+    return chunks
+
+
+def test_entrypoint_output_captured_to_durable_file(server, tmp_path):
+    """The main process's stdout is captured host-side to the durable capture file
+    and finalized before the controlled terminal. Read it back from the daemon's
+    data dir and decode the internal framing to confirm the bytes are retained —
+    including the TAIL (last write), pinning that the exit path drains the console
+    fully to the real Exit before finalizing (no dropped tail)."""
+    sid = server.create(
+        entrypoint=["sh", "-c", "printf 'START_MARKER '; printf 'END_MARKER\\n'"]
+    )
+    try:
+        # The entrypoint exits, coupling the VM to a terminal (Failed) state; the
+        # capture file is retained until destroy.
+        server.wait_state(sid, "Failed")
+        cap = tmp_path / "data" / "sessions" / sid / "entrypoint-capture.bin"
+        text = b"".join(b for _s, b in _decode_capture(cap)).decode(errors="replace")
+        assert "START_MARKER" in text, f"captured output missing; got {text!r}"
+        assert "END_MARKER" in text, f"capture dropped the tail; got {text!r}"
+    finally:
+        server.destroy(sid)
+
+
+def test_controlled_destroy_flushes_mount_writes(server, tmp_path):
+    """Controlled destroy is lossless: a caller exec writes a payload through an rw
+    mount, then destroy closes the console so the guest quiesces + syncs before the
+    backstop kill — the exact bytes survive on the host."""
+    shared = tmp_path / "durable"
+    shared.mkdir()
+    sid = server.create(
+        mounts=[{"host_path": str(shared), "guest_path": "/out", "read_only": False}],
+    )
+    server.wait_state(sid, "Running")
+    payload = "durable-payload-12345"
+    status, events = server.command(sid, f"printf %s {payload} > /out/data.txt")
+    assert status == 200
+    assert any(e.get("type") == "execution_complete" for e in events), events
+    server.destroy(sid)
+    server.wait_state(sid, "Terminated")
+    assert (shared / "data.txt").read_text() == payload
+
+
+def _child_pids(parent_pid):
+    """PIDs of processes whose parent is `parent_pid` (via /proc/<pid>/stat). The
+    daemon forks each VM directly, so its VM children appear here."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                # `pid (comm) state ppid ...`; comm may contain spaces/parens, so
+                # split after the final ')': fields are [state, ppid, ...].
+                after_comm = f.read().rsplit(")", 1)[1].split()
+            if int(after_comm[1]) == parent_pid:
+                pids.append(int(entry))
+        except (OSError, ValueError, IndexError):
+            continue
+    return pids
+
+
+def test_oversize_entrypoint_fails_start_without_wedging(server):
+    """An entrypoint whose serialized exec frame exceeds the 1 MiB console limit
+    fails AFTER the VM is forked (a post-fork launch failure). The VM must unwind
+    cleanly to StartFailed, leave NO orphaned VM child process, and leave the
+    daemon able to boot fresh sandboxes."""
+    baseline = set(_child_pids(server.daemon_pid))
+    big_arg = "x" * (1024 * 1024 + 64)
+    sid = server.create(entrypoint=["/bin/true", big_arg])
+    try:
+        server.wait_state(sid, "Failed")
+        assert server.status(sid)["status"]["reason"] == "start_failed"
+        # The post-fork unwind kills + reaps the forked VM; poll until the daemon's
+        # VM children return to baseline (the unwind/kill is asynchronous).
+        deadline = time.monotonic() + 30
+        leaked = None
+        while time.monotonic() < deadline:
+            leaked = set(_child_pids(server.daemon_pid)) - baseline
+            if not leaked:
+                break
+            time.sleep(0.2)
+        assert not leaked, f"failed start orphaned VM child process(es): {leaked}"
+        # The daemon is unharmed by the post-fork unwind: a fresh sandbox boots.
+        sid2 = server.create()
+        server.wait_state(sid2, "Running")
+        # Sanity: the helper actually observes a running VM as a daemon child, so
+        # the empty `leaked` set above is a real signal, not a blind spot.
+        assert _child_pids(server.daemon_pid), (
+            "expected the running VM as a daemon child"
+        )
+        server.destroy(sid2)
+    finally:
+        server.destroy(sid)

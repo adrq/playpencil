@@ -1364,6 +1364,7 @@ dependencies = [
  "krun-sys",
  "libc",
  "oci-spec",
+ "playpencil-exec",
  "reqwest",
  "serde",
  "serde_json",
@@ -1381,10 +1382,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "playpencil-exec"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "playpencil-init"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "playpencil-exec",
  "serde",
  "serde_json",
 ]
@@ -1396,6 +1410,7 @@ dependencies = [
  "axum",
  "futures-util",
  "playpencil-core",
+ "playpencil-exec",
  "serde",
  "serde_json",
  "tokio",

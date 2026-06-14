@@ -16,6 +16,9 @@ pub(crate) struct CreateSandboxRequest {
     #[serde(default)]
     pub env: HashMap<String, String>,
     pub name: Option<String>,
+    /// Optional command to run as the sandbox's main process.
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
 }
 
 /// Image reference (object form). Only `uri` is used today; `auth` is accepted but ignored.

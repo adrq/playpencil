@@ -1,0 +1,29 @@
+[package]
+name = "playpencil-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# fork/exec children, multiplex N execs over one channel, per-id flow control.
+# libc, NO tokio, cross-platform (Linux + macOS). See the producer firewall in
+# the crate docs: producer code must never reach for tokio.
+producer = ["dep:libc"]
+# tokio demux engine: one transport <-> N per-id sessions, credit accounting,
+# priority/bulk write scheduling, teardown. NO libc (signal numbers are
+# crate-owned consts), mac-portable.
+relay = ["dep:tokio", "dep:tokio-util", "dep:tracing"]
+# consumer-edge helpers: incremental UTF-8 decode, TERM->KILL escalation, and the
+# ExecHandle driving API. NO libc.
+consumer = ["dep:tokio", "dep:tokio-util"]
+# Optional convenience alias for a host that wants both engine sides.
+host = ["relay", "consumer"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }

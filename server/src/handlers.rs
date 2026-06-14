@@ -10,7 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use playpencil_core::backend::{BackendError, SandboxBackendSend};
 use playpencil_core::types::{
-    MountConfig, NetworkPolicy, ResourceLimits, SandboxConfig, SandboxId,
+    MountConfig, NetworkPolicy, ResourceLimits, SandboxConfig, SandboxId, validate_entrypoint,
 };
 
 use crate::adapter::{build_response, project_wire_state};
@@ -30,6 +30,9 @@ fn request_to_config(body: CreateSandboxRequest) -> Result<SandboxConfig, ApiErr
         ));
     }
     let network: NetworkPolicy = body.network.try_into().map_err(ApiError::Validation)?;
+    // Mirror the core validation early for a clean 4xx; the backend create path
+    // and the durable record validator enforce it again.
+    validate_entrypoint(body.entrypoint.as_deref()).map_err(ApiError::Validation)?;
     Ok(SandboxConfig {
         name: body.name,
         image: body.image.uri,
@@ -49,6 +52,7 @@ fn request_to_config(body: CreateSandboxRequest) -> Result<SandboxConfig, ApiErr
             .collect(),
         network,
         env: body.env.into_iter().collect(),
+        entrypoint: body.entrypoint,
     })
 }
 
@@ -337,6 +341,7 @@ mod tests {
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
+            entrypoint: None,
         }
     }
 

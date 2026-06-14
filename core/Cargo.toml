@@ -10,6 +10,7 @@ name = "playpencil_core"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [dependencies]
+playpencil-exec = { path = "../exec", features = ["relay", "consumer"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 krun-sys = { workspace = true }

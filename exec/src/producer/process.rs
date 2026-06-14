@@ -1,59 +1,58 @@
+//! The process state machine: fork/exec a child, own its pipes + pre-exec error
+//! pipe, resolve and drop credentials, and reap. `std` + `libc`, sync, no tokio.
+//! Cross-platform (Linux + macOS); the only non-portable spot is pipe creation
+//! (`pipe2` vs `pipe`+`fcntl`) and the `setgroups` `ngroups` arg type — both
+//! handled below. In playpencil this runs only as the Linux guest; the macOS
+//! arms are for a downstream native worker (credential-by-uid is best-effort
+//! there).
+
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
 
-use crate::proto::{ExecMode, GuestMessage, base64_encode};
-
-/// Per-id outstanding-stdin-bytes cap. Must match the host's INPUT_WINDOW: the
-/// guest never buffers more than this for one exec, and emits credit grants as
-/// it drains so the host may send more.
-pub const INPUT_WINDOW: usize = 256 * 1024;
-
-/// Grant credit once at least this many buffered bytes have been written to the
-/// child, batching grants so a steady stdin stream does not emit a frame per
-/// write.
-pub const CREDIT_GRANT_THRESHOLD: usize = INPUT_WINDOW / 4;
+use crate::protocol::codec::base64_encode;
+use crate::protocol::{ExecMode, GuestFrame};
 
 /// State of a single running exec.
-pub struct ExecEntry {
-    pub pid: libc::pid_t,
+pub(crate) struct ExecEntry {
+    pub(crate) pid: libc::pid_t,
     /// Write end of child's stdin pipe (nonblocking). -1 once closed.
-    pub stdin_fd: RawFd,
+    pub(crate) stdin_fd: RawFd,
     /// Read end of child's stdout pipe.
-    pub stdout_fd: RawFd,
+    pub(crate) stdout_fd: RawFd,
     /// Read end of child's stderr pipe.
-    pub stderr_fd: RawFd,
+    pub(crate) stderr_fd: RawFd,
     /// Read end of the pre-exec error pipe. EOF-empty = the command started;
     /// any bytes = a pre-exec failure reason. -1 once closed.
-    pub start_err_fd: RawFd,
-    pub stdout_closed: bool,
-    pub stderr_closed: bool,
-    pub start_err_closed: bool,
+    pub(crate) start_err_fd: RawFd,
+    pub(crate) stdout_closed: bool,
+    pub(crate) stderr_closed: bool,
+    pub(crate) start_err_closed: bool,
     /// Exit code, set when waitpid confirms the child exited.
-    pub exit_code: Option<i32>,
+    pub(crate) exit_code: Option<i32>,
     /// Deadline after which lingering process group members are killed so pipes
     /// drain. Set when the leader exits; None until then and cleared after kill.
-    pub grace_deadline: Option<std::time::Instant>,
+    pub(crate) grace_deadline: Option<std::time::Instant>,
     /// Output flow-control: when set, this child's stdout/stderr fds are dropped
     /// from the poll set so the child's `write()` blocks (only this command).
-    pub paused: bool,
+    pub(crate) paused: bool,
     /// Buffered incoming stdin awaiting nonblocking write to the child. Never
-    /// exceeds [`INPUT_WINDOW`].
-    pub stdin_buf: VecDeque<u8>,
+    /// exceeds [`INPUT_WINDOW`](crate::protocol::limits::INPUT_WINDOW).
+    pub(crate) stdin_buf: VecDeque<u8>,
     /// Host signalled EOF; close the child's stdin fd once `stdin_buf` drains.
-    pub stdin_eof_pending: bool,
+    pub(crate) stdin_eof_pending: bool,
     /// Bytes written to the child since the last credit grant.
-    pub credit_pending: usize,
+    pub(crate) credit_pending: usize,
     /// Accumulated pre-exec error bytes (emitted as the terminal at completion).
-    pub start_err_buf: Vec<u8>,
+    pub(crate) start_err_buf: Vec<u8>,
 }
 
 impl ExecEntry {
     /// True once the exit code is collected and stdout, stderr, and the
     /// start-error pipe are all drained — so a start-error reason is captured
     /// before the terminal frame is emitted.
-    pub fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.exit_code.is_some()
             && self.stdout_closed
             && self.stderr_closed
@@ -61,7 +60,7 @@ impl ExecEntry {
     }
 
     /// The captured start-error reason, if the command failed to start.
-    pub fn start_error(&self) -> Option<String> {
+    pub(crate) fn start_error(&self) -> Option<String> {
         if self.start_err_buf.is_empty() {
             None
         } else {
@@ -84,21 +83,21 @@ impl Drop for ExecEntry {
 }
 
 /// Resolved credential drop computed from `/etc/passwd` + `/etc/group`.
-pub struct CredentialPlan {
+pub(crate) struct CredentialPlan {
     /// Supplemental groups to install via `setgroups` before `setgid`/`setuid`.
     /// `Some(_)` (including an empty vec) means call `setgroups`; an empty vec
     /// clears all supplemental groups. `resolve_credentials` always returns
     /// `Some` for a requested uid so the child never inherits init's groups.
-    pub supplemental: Option<Vec<u32>>,
+    pub(crate) supplemental: Option<Vec<u32>>,
     /// Effective gid target (`setgid`).
-    pub gid: u32,
-    pub uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) uid: u32,
 }
 
 /// Compute the credential drop for `uid` from passwd/group file contents. Pure
 /// and host-independent so it can be unit-tested. `gid_override` forces the
 /// setgid target; supplemental groups are still derived from the resolved login.
-pub fn resolve_credentials(
+pub(crate) fn resolve_credentials(
     passwd: &str,
     group: &str,
     uid: u32,
@@ -159,7 +158,7 @@ pub fn resolve_credentials(
 /// failures (empty/NUL command, bad NUL in env/workdir) return `Err`, which the
 /// caller surfaces as a start-error. Once the fork succeeds, any pre-exec
 /// failure in the child is reported via the start-error pipe (not the exit code).
-pub fn start_exec(
+pub(crate) fn start_exec(
     cmd: &[String],
     env: &[String],
     workdir: Option<&str>,
@@ -292,10 +291,14 @@ pub fn start_exec(
     })
 }
 
-/// Read available data from a pipe fd, encode it, and return a GuestMessage.
+/// Read available data from a pipe fd, encode it, and return a GuestFrame.
 /// Returns None if the pipe is closed (EOF). Returns Some(msg) if data was read.
 /// The returned bool indicates whether the fd is now closed.
-pub fn read_pipe_chunk(exec_id: &str, fd: RawFd, is_stderr: bool) -> (Option<GuestMessage>, bool) {
+pub(crate) fn read_pipe_chunk(
+    exec_id: &str,
+    fd: RawFd,
+    is_stderr: bool,
+) -> (Option<GuestFrame>, bool) {
     let mut buf = [0u8; 8192];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -311,12 +314,12 @@ pub fn read_pipe_chunk(exec_id: &str, fd: RawFd, is_stderr: bool) -> (Option<Gue
         }
         let data = base64_encode(&buf[..n as usize]);
         let msg = if is_stderr {
-            GuestMessage::Stderr {
+            GuestFrame::Stderr {
                 id: exec_id.to_string(),
                 data,
             }
         } else {
-            GuestMessage::Stdout {
+            GuestFrame::Stdout {
                 id: exec_id.to_string(),
                 data,
             }
@@ -327,7 +330,7 @@ pub fn read_pipe_chunk(exec_id: &str, fd: RawFd, is_stderr: bool) -> (Option<Gue
 
 /// Read available bytes from the pre-exec error pipe into `buf`. Returns true
 /// when the pipe reached EOF (the read end can then be closed).
-pub fn read_start_err(fd: RawFd, buf: &mut Vec<u8>) -> bool {
+pub(crate) fn read_start_err(fd: RawFd, buf: &mut Vec<u8>) -> bool {
     let mut tmp = [0u8; 256];
     loop {
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
@@ -347,7 +350,7 @@ pub fn read_start_err(fd: RawFd, buf: &mut Vec<u8>) -> bool {
 }
 
 /// Non-blocking waitpid check. Returns Some(exit_code) if child has exited.
-pub fn check_child_exit(pid: libc::pid_t) -> Option<i32> {
+pub(crate) fn check_child_exit(pid: libc::pid_t) -> Option<i32> {
     loop {
         let mut status: libc::c_int = 0;
         let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -445,7 +448,9 @@ fn child_exec(
     // Credential drop (while still privileged): setgroups, setgid, setuid.
     if let Some(c) = cred {
         if let Some(supp) = &c.supplemental {
-            let ret = unsafe { libc::setgroups(supp.len() as libc::size_t, supp.as_ptr()) };
+            // `ngroups` is `size_t` on Linux and `c_int` on macOS — `as _` casts
+            // to whichever the platform's `setgroups` expects.
+            let ret = unsafe { libc::setgroups(supp.len() as _, supp.as_ptr()) };
             if ret < 0 {
                 write_start_err(serr, &format!("setgroups: {}", io::Error::last_os_error()));
                 unsafe { libc::_exit(1) };
@@ -542,11 +547,27 @@ fn write_start_err(fd: RawFd, msg: &str) {
     }
 }
 
+/// Create a close-on-exec pipe. Uses `pipe2(O_CLOEXEC)` on Linux; on other unix
+/// (macOS) `pipe2` is unavailable, so fall back to `pipe` + `fcntl(FD_CLOEXEC)`.
+/// The non-atomic fallback is fine for the single-threaded guest; a downstream
+/// multi-threaded mac worker would lock around fork/accept.
 fn pipe_cloexec() -> Result<(RawFd, RawFd), io::Error> {
     let mut fds = [0i32; 2];
+    #[cfg(target_os = "linux")]
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    for fd in fds {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            let err = io::Error::last_os_error();
+            close_if_open(fds[0]);
+            close_if_open(fds[1]);
+            return Err(err);
+        }
     }
     Ok((fds[0], fds[1]))
 }

@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use playpencil_exec::protocol::limits::MAX_FRAME_BYTES;
+
 use crate::Error;
 
 const RETRY_ATTEMPTS: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_millis(200);
-const MAX_LINE_SIZE: usize = 1024 * 1024; // 1MB
 
 /// Buffered wrapper around the virtio-console fd.
 /// Persists partial reads across calls so multi-message and
@@ -161,7 +162,7 @@ pub fn poll_and_read_line(
 
         // Buffer exceeded max without a newline — return error immediately,
         // set discard flag so subsequent reads drain until the newline arrives
-        if console.buf.len() > MAX_LINE_SIZE {
+        if console.buf.len() > MAX_FRAME_BYTES {
             console.buf.clear();
             console.discarding = true;
             return Err(io::Error::new(
@@ -255,11 +256,11 @@ pub fn write_line(console: &Console, data: &str) -> Result<(), io::Error> {
 }
 
 /// Extract a complete newline-terminated line from the buffer.
-/// Rejects lines that exceed MAX_LINE_SIZE.
+/// Rejects lines that exceed MAX_FRAME_BYTES.
 fn extract_line(buf: &mut Vec<u8>) -> Result<Option<String>, io::Error> {
     if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
         let line_len = pos; // excluding newline
-        if line_len > MAX_LINE_SIZE {
+        if line_len > MAX_FRAME_BYTES {
             // Oversized line arrived in one read — drain it and reject
             buf.drain(..=pos);
             return Err(io::Error::new(

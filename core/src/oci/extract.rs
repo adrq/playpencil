@@ -364,14 +364,12 @@ fn validate_symlink_target(link_path: &Path, target: &Path) -> Result<(), OciErr
         match component {
             Component::Normal(c) => clean.push(c),
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !clean.pop() {
-                    return Err(OciError::UnsafeTarEntry(format!(
-                        "symlink escapes destination: {} -> {}",
-                        link_path.display(),
-                        target.display()
-                    )));
-                }
+            Component::ParentDir if !clean.pop() => {
+                return Err(OciError::UnsafeTarEntry(format!(
+                    "symlink escapes destination: {} -> {}",
+                    link_path.display(),
+                    target.display()
+                )));
             }
             _ => {}
         }
