@@ -1,4 +1,4 @@
-# Derived from https://github.com/adrq/agentbeacon/blob/main/tests/testhelpers.py (Apache-2.0)
+# Derived from https://github.com/adrq/agentbeacon/blob/main/tests/testhelpers.py (AGPL-3.0-or-later)
 """Common utilities for test process and file cleanup.
 
 These helpers centralize robust termination of subprocesses and cleanup of
