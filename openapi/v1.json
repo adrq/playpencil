@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Playpencil API",
-    "description": "The `/v1` HTTP API of the Playpencil sandbox daemon (default `127.0.0.1:7070`).\n\n**Compatibility.** Unknown request fields are ignored. Clients must tolerate unknown response fields and unlisted values, including notice codes.\n\n**Errors** are RFC 9457 problem details, except the bodiless health `503`. An unreadable, malformed (trailing content included) or non-JSON body, or an unparseable query string, gets a bare `400`; any other invalid request gets `422` `invalid_input`. Integers must be plain JSON integers (no fraction, exponent or `-0`). `401` and `403` are reserved and not returned by this version.\n\nWrites return `202`; read convergence from `status`. Timestamps are RFC 3339; binary data is base64.\n\n**Environment.** `env` maps are written as `{NAME: value}` and read back as names only. A process gets the baseline, then the sandbox's `config.env`, then its own `env` (later wins); `PLAYPENCIL_*` names are removed and nothing is inherited. Baseline: `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`, `LANG=C`, `LC_ALL=C`.\n\n**Defaults.** Stop grace 5 s (flush, then kill). Reap tolerance 60 s.\n",
+    "description": "The `/v1` HTTP API of the Playpencil sandbox daemon (default `127.0.0.1:7070`).\n\n**Compatibility.** Unknown request fields are ignored. Clients must tolerate unknown response fields and unlisted values, including notice codes.\n\n**Errors** are RFC 9457 problem details, except the bodiless health `503`. An unreadable, malformed (trailing content included) or non-JSON body, or an unparseable query string, gets a bare `400`; any other invalid request gets `422` `invalid_input`. Integers must be plain JSON integers (no fraction, exponent or `-0`). `401` and `403` are reserved and not returned by this version.\n\nTimestamps are RFC 3339; binary data is base64.\n\n**Environment.** `env` maps are written as `{NAME: value}` and read back as names only. A process gets the baseline, then the sandbox's `config.env`, then its own `env` (later wins); `PLAYPENCIL_*` names are removed and nothing is inherited. Baseline: `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `TERM=xterm`, `LANG=C`, `LC_ALL=C`, and `HOME`: /root when the effective uid is 0; otherwise no baseline value — the sandbox's config.env or the command spec must supply it. A non-root process whose layered environment has no `HOME` is `422` with `field` `env`, refused by the create, cold PATCH or spawn that produces it.\n\n**Defaults.** Stop grace 5 s (flush, then kill). Reap tolerance 60 s.\n",
     "license": {
       "name": "AGPL-3.0-or-later",
       "identifier": "AGPL-3.0-or-later"
@@ -467,7 +467,7 @@
           "processes"
         ],
         "summary": "Spawn a detached process in a sandbox.",
-        "description": "A synchronous start failure is `422`; later failures appear on the record. Not ready: `409`.",
+        "description": "Any failure after the spawn is admitted is `start_failed` on the process record and its stream. Not ready: `409`.",
         "operationId": "spawn_process",
         "parameters": [
           {
@@ -538,7 +538,7 @@
             }
           },
           "422": {
-            "description": "Invalid, or failed to start.",
+            "description": "Invalid.",
             "content": {
               "application/problem+json": {
                 "schema": {

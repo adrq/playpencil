@@ -6,7 +6,7 @@ use crate::v1::types::process::{ProcessList, ProcessRecord};
 
 /// Spawn a detached process in a sandbox.
 ///
-/// A synchronous start failure is `422`; later failures appear on the record. Not ready: `409`.
+/// Any failure after the spawn is admitted is `start_failed` on the process record and its stream. Not ready: `409`.
 #[expect(dead_code)]
 #[utoipa::path(
     post,
@@ -22,7 +22,7 @@ use crate::v1::types::process::{ProcessList, ProcessRecord};
         (status = 403, description = "Reserved."),
         (status = 404, description = "Not found.", body = NotFoundProblem, content_type = "application/problem+json"),
         (status = 409, description = "Conflict.", body = ProcessConflictProblem, content_type = "application/problem+json"),
-        (status = 422, description = "Invalid, or failed to start.", body = InvalidInputProblem, content_type = "application/problem+json"),
+        (status = 422, description = "Invalid.", body = InvalidInputProblem, content_type = "application/problem+json"),
     ),
 )]
 pub(crate) async fn spawn_process() {}

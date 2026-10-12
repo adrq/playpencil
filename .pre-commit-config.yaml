@@ -55,6 +55,12 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
+      - id: openapi-check
+        name: openapi document up to date
+        entry: make check-openapi
+        language: system
+        pass_filenames: false
+        files: ^(server/|openapi/|scripts/check_openapi_spec\.py$|Cargo\.(toml|lock)$|Makefile$|pyproject\.toml$|uv\.lock$)
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.13.1
     hooks:
