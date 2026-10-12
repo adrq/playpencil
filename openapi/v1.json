@@ -1,0 +1,2324 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Playpencil API",
+    "description": "The `/v1` HTTP API of the Playpencil sandbox daemon (default `127.0.0.1:7070`).\n\n**Compatibility.** Unknown request fields are ignored. Clients must tolerate unknown response fields and unlisted values, including notice codes.\n\n**Errors** are RFC 9457 problem details, except the bodiless health `503`. An unreadable, malformed (trailing content included) or non-JSON body, or an unparseable query string, gets a bare `400`; any other invalid request gets `422` `invalid_input`. Integers must be plain JSON integers (no fraction, exponent or `-0`). `401` and `403` are reserved and not returned by this version.\n\nWrites return `202`; read convergence from `status`. Timestamps are RFC 3339; binary data is base64.\n\n**Environment.** `env` maps are written as `{NAME: value}` and read back as names only. A process gets the baseline, then the sandbox's `config.env`, then its own `env` (later wins); `PLAYPENCIL_*` names are removed and nothing is inherited. Baseline: `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`, `LANG=C`, `LC_ALL=C`.\n\n**Defaults.** Stop grace 5 s (flush, then kill). Reap tolerance 60 s.\n",
+    "license": {
+      "name": "AGPL-3.0-or-later",
+      "identifier": "AGPL-3.0-or-later"
+    },
+    "version": "v1"
+  },
+  "paths": {
+    "/v1/sandboxes": {
+      "get": {
+        "tags": [
+          "sandboxes"
+        ],
+        "summary": "List sandboxes.",
+        "operationId": "list_sandboxes",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Comma-separated.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "`null`: no committed state yet.",
+                "enum": [
+                  "null",
+                  "stopped",
+                  "running",
+                  "destroyed"
+                ]
+              },
+              "minItems": 1
+            },
+            "style": "form",
+            "explode": false
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Exact match.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "query",
+            "description": "Exact match.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sandboxes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unparseable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "422": {
+            "description": "Invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidInputProblem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "sandboxes"
+        ],
+        "summary": "Create a sandbox.",
+        "description": "Idempotent on `name`: the same namespace and configuration (defaults applied, `desired_state` ignored) returns the existing document; otherwise `409` with `existing_id`. A missing `config.network`, or a missing or unknown `config.backend` (with `available_backends`), is `422`.",
+        "operationId": "create_sandbox",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSandboxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Sandbox.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxDocument"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unparseable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "409": {
+            "description": "Conflict.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateConflictProblem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidInputProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{id}": {
+      "get": {
+        "tags": [
+          "sandboxes"
+        ],
+        "summary": "Read a sandbox.",
+        "operationId": "get_sandbox",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sandbox.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxDocument"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "sandboxes"
+        ],
+        "summary": "Change a sandbox's target state or configuration.",
+        "description": "`202` even when nothing changes.\n- No `if_version`: `422`; stale: `409` with `current_version`.\n- `network` (hot) is accepted in any state. `mounts`, `env` and `main` (cold) only when `state` is `stopped` and `desired` is `stopped` or a `reason` is set, else `409`; they take effect at the next start. `backend` and `backend_options` are immutable (`422`).\n- `destroyed` is final (`409`). While a `reason` is set, changing `desired_state` needs `clear_reason` = `reason.id`, else `409`; configuration-only writes leave `reason` unchanged.\n- Validation is all-or-nothing. `config` applies before `desired_state`; `network` is enforced before the response, and if that fails: `500`, the old policy stays and `desired_state` isn't applied.",
+        "operationId": "update_sandbox",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchSandboxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Sandbox.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxDocument"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unparseable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchConflictProblem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidInputProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Policy not applied.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{id}/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Stream a sandbox's events.",
+        "description": "Server-sent events: `event` is `changed` or `notice`, `id` the cursor, `data` a `ChangedEvent` or `NoticeEvent`. Resume with the cursor as `since` or `Last-Event-ID` (preferred).\n\nOn connect: (1) with a cursor, the events after it are replayed, or a `gap` notice if they aren't retained; (2) the baseline at one cut (`changed`, `pin_registered`, `host_addresses_changed`; flagged `baseline: true`, with the cut `seq` and cursor); (3) `resync`; (4) live events, including changes made during the baseline. A policy change's `changed` event separates denials under the old and new policy. The buffer is bounded.",
+        "operationId": "stream_sandbox_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Takes precedence over `since`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event stream.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unparseable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/streams": {
+      "get": {
+        "tags": [
+          "streams"
+        ],
+        "summary": "Open the streaming link.",
+        "description": "WebSocket upgrade to the streaming-link protocol (open processes, attach, control); its frames aren't described here. A stream whose owning link drops is held for the reap tolerance, then interrupted.",
+        "operationId": "open_stream",
+        "responses": {
+          "101": {
+            "description": "Switching protocols.",
+            "headers": {
+              "Connection": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`Upgrade`"
+              },
+              "Upgrade": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`websocket`"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{id}/processes": {
+      "get": {
+        "tags": [
+          "processes"
+        ],
+        "summary": "List a sandbox's processes.",
+        "operationId": "list_processes",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Processes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "processes"
+        ],
+        "summary": "Spawn a detached process in a sandbox.",
+        "description": "A synchronous start failure is `422`; later failures appear on the record. Not ready: `409`.",
+        "operationId": "spawn_process",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandSpecWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unparseable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessConflictProblem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid, or failed to start.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidInputProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{id}/processes/{pid}": {
+      "get": {
+        "tags": [
+          "processes"
+        ],
+        "summary": "Read a process.",
+        "operationId": "get_process",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pid",
+            "in": "path",
+            "description": "Process id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessRecord"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "processes"
+        ],
+        "summary": "Interrupt a process (TERM, grace period, KILL).",
+        "description": "The record turns terminal only on confirmed termination. Ended or superseded: `409`.",
+        "operationId": "interrupt_process",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sandbox id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pid",
+            "in": "path",
+            "description": "Process id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted."
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundProblem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessConflictProblem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/capabilities": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Enforcement fidelity and listening addresses.",
+        "operationId": "get_capabilities",
+        "responses": {
+          "200": {
+            "description": "Capabilities.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Daemon liveness; no body.",
+        "operationId": "get_health",
+        "responses": {
+          "200": {
+            "description": "Healthy."
+          },
+          "401": {
+            "description": "Reserved."
+          },
+          "403": {
+            "description": "Reserved."
+          },
+          "503": {
+            "description": "Unhealthy."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Backend": {
+        "type": "object",
+        "required": [
+          "backend_id",
+          "isolation_tier",
+          "provenance",
+          "dials"
+        ],
+        "properties": {
+          "backend_id": {
+            "type": "string",
+            "description": "Value for `config.backend`."
+          },
+          "isolation_tier": {
+            "type": "string",
+            "description": "`hardware` or `process`."
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "dials": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Dial"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "CapabilitiesResponse": {
+        "type": "object",
+        "required": [
+          "listeners",
+          "backends"
+        ],
+        "properties": {
+          "listeners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Concrete `addr:port`s the daemon listens on, the streaming link included; wildcard binds are expanded."
+          },
+          "backends": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Backend"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "ChangedEvent": {
+        "type": "object",
+        "description": "The document after a change.",
+        "required": [
+          "seq",
+          "at",
+          "document"
+        ],
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9223372036854775807,
+            "minimum": 0
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "document": {
+            "$ref": "#/components/schemas/SandboxDocument"
+          }
+        },
+        "additionalProperties": true
+      },
+      "CommandSpecRead": {
+        "type": "object",
+        "required": [
+          "command",
+          "env",
+          "cwd"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "env": {
+            "$ref": "#/components/schemas/EnvNames"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "uid": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "gid": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 4294967295,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      },
+      "CommandSpecWrite": {
+        "type": "object",
+        "required": [
+          "command",
+          "env",
+          "cwd"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Program and arguments.",
+            "minItems": 1
+          },
+          "env": {
+            "$ref": "#/components/schemas/EnvWrite"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "uid": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "gid": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 4294967295,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      },
+      "ConfigCreate": {
+        "type": "object",
+        "required": [
+          "backend",
+          "network"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "A `backend_id` from `/v1/capabilities`."
+          },
+          "backend_options": {
+            "type": "object",
+            "description": "Defined by the backend; `libkrun` requires `image: {uri}`.",
+            "additionalProperties": true
+          },
+          "network": {
+            "$ref": "#/components/schemas/NetworkWrite"
+          },
+          "mounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Mount"
+            },
+            "default": []
+          },
+          "env": {
+            "$ref": "#/components/schemas/EnvWrite",
+            "default": {}
+          },
+          "main": {
+            "$ref": "#/components/schemas/CommandSpecWrite",
+            "description": "Its exit stops the sandbox (`exited` if clean, else `crashed`) and kills its descendants; some may escape on `BestEffort` backends. Absent: the sandbox is idle and exec-only, with exec-spawned processes unbounded."
+          }
+        },
+        "additionalProperties": true
+      },
+      "ConfigPatch": {
+        "type": "object",
+        "description": "Present members replace the current value wholesale; absent ones are unchanged.",
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "backend_options": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "network": {
+            "$ref": "#/components/schemas/NetworkWrite"
+          },
+          "mounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Mount"
+            }
+          },
+          "env": {
+            "$ref": "#/components/schemas/EnvWrite"
+          },
+          "main": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CommandSpecWrite",
+                "description": "`null` removes it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true
+      },
+      "ConfigRead": {
+        "type": "object",
+        "description": "As written; members omitted at create are omitted.",
+        "required": [
+          "backend",
+          "network"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "backend_options": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "network": {
+            "$ref": "#/components/schemas/NetworkRead"
+          },
+          "mounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Mount"
+            }
+          },
+          "env": {
+            "$ref": "#/components/schemas/EnvNames"
+          },
+          "main": {
+            "$ref": "#/components/schemas/CommandSpecRead"
+          }
+        },
+        "additionalProperties": true
+      },
+      "CreateConflictProblem": {
+        "type": "object",
+        "required": [
+          "type",
+          "existing_id"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://playpencil.dev/problems/conflict"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          },
+          "existing_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "CreateSandboxRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "namespace",
+          "config"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique per daemon; immutable.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Exact and case-sensitive; `\"*\"` is reserved; immutable."
+          },
+          "desired_state": {
+            "$ref": "#/components/schemas/DesiredState",
+            "description": "`stopped` stops gracefully (see `flush_incomplete`); `destroyed` keeps the record.",
+            "default": "running"
+          },
+          "config": {
+            "$ref": "#/components/schemas/ConfigCreate"
+          }
+        },
+        "additionalProperties": true
+      },
+      "DenyDetails": {
+        "anyOf": [
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "port",
+              "protocol",
+              "cause"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "ip": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer",
+                "format": "int32",
+                "maximum": 65535,
+                "minimum": 0
+              },
+              "protocol": {
+                "type": "string",
+                "description": "`tcp` or `udp`."
+              },
+              "cause": {
+                "type": "string",
+                "description": "`unmatched`, `host_local`, `resolution_validation` or `mode`."
+              },
+              "expired_pin": {
+                "type": "string",
+                "description": "Name whose expired pin caused the denial."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "ip",
+              "port",
+              "protocol",
+              "cause"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "ip": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer",
+                "format": "int32",
+                "maximum": 65535,
+                "minimum": 0
+              },
+              "protocol": {
+                "type": "string",
+                "description": "`tcp` or `udp`."
+              },
+              "cause": {
+                "type": "string",
+                "description": "`unmatched`, `host_local`, `resolution_validation` or `mode`."
+              },
+              "expired_pin": {
+                "type": "string",
+                "description": "Name whose expired pin caused the denial."
+              }
+            },
+            "additionalProperties": true
+          }
+        ],
+        "description": "At least one of `name` and `ip`."
+      },
+      "DesiredState": {
+        "type": "string",
+        "enum": [
+          "stopped",
+          "running",
+          "destroyed"
+        ]
+      },
+      "Dial": {
+        "type": "object",
+        "required": [
+          "dial",
+          "level",
+          "mechanism",
+          "known_limitations"
+        ],
+        "properties": {
+          "dial": {
+            "type": "string",
+            "description": "`egress_none`, `egress_allowlist`, `fs_workspace_confinement` or `teardown_confirmation` (`Strong`: verified empty; `BestEffort`: escaped descendants may survive)."
+          },
+          "level": {
+            "type": "string",
+            "description": "`Strong`, `BestEffort` or `Unsupported`."
+          },
+          "mechanism": {
+            "type": "string"
+          },
+          "known_limitations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "EmptyEntries": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 0
+      },
+      "EnvNames": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Names only."
+      },
+      "EnvWrite": {
+        "type": "object",
+        "description": "`{NAME: value}`.",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "propertyNames": {
+          "type": "string"
+        }
+      },
+      "FlushIncompleteDetails": {
+        "type": "object",
+        "required": [
+          "phase",
+          "waited_ms"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string",
+            "description": "`stop` or `destroy`."
+          },
+          "waited_ms": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9223372036854775807,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      },
+      "GapDetails": {
+        "type": "object",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "Resumed-from cursor (excluded)."
+          },
+          "to": {
+            "type": "string",
+            "description": "Cut cursor (included); cursors aren't comparable."
+          }
+        },
+        "additionalProperties": true
+      },
+      "HostAddressesChangedDetails": {
+        "type": "object",
+        "required": [
+          "addresses"
+        ],
+        "properties": {
+          "addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "baseline": {
+            "type": "boolean",
+            "description": "`true` in the baseline."
+          }
+        },
+        "additionalProperties": true
+      },
+      "InternalProblem": {
+        "type": "object",
+        "description": "Policy not applied; the previous one is still enforced.",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://playpencil.dev/problems/internal"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "InvalidInputProblem": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://playpencil.dev/problems/invalid_input"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string",
+            "description": "Offending field path."
+          },
+          "available_backends": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "When `config.backend` is missing or unknown."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why `entries` were rejected."
+          }
+        },
+        "additionalProperties": true
+      },
+      "Mount": {
+        "type": "object",
+        "description": "A host directory bound into the sandbox; `guest_path`s are unique. Access is limited to the daemon user's permissions and stays within the directory. Close-to-open consistency, POSIX locks, atomic rename. Unflushed writes can be lost on abrupt death; a graceful stop flushes them.",
+        "required": [
+          "host_path",
+          "guest_path",
+          "read_only"
+        ],
+        "properties": {
+          "host_path": {
+            "type": "string"
+          },
+          "guest_path": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      },
+      "NetworkRead": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "entries": {
+                "$ref": "#/components/schemas/EmptyEntries",
+                "description": "Only if written."
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "none"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "entries",
+              "mode"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "allowlist"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "entries",
+              "mode"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "all"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Unlisted mode.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "not": {
+                  "enum": [
+                    "none",
+                    "allowlist",
+                    "all"
+                  ]
+                }
+              },
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        ],
+        "description": "As written; `mode` may take other values."
+      },
+      "NetworkWrite": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "entries": {
+                "$ref": "#/components/schemas/EmptyEntries"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "none"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "entries",
+              "mode"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "allowlist"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "entries",
+              "mode"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "all"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        ],
+        "description": "`none`: nothing reachable. `allowlist`: only the entries. `all`: all egress; entries only grant host-local access.\n\nHost-local addresses (loopback, link-local, the host's own, the daemon's) are reachable only via `host.internal` (an exact entry, never matched by a wildcard) or a covering address or CIDR, which keeps granting even if the host later acquires the address; guest loopback never reaches the host. Names match exactly, `*.name` proper subdomains only, addresses and CIDRs by prefix; TCP and UDP only. Only permitted names resolve (others get NXDOMAIN and a `deny` notice), to public addresses only (under `all`, also non-host special-use ones) unless a literal covers them; resolved addresses are pinned until TTL expiry or re-resolution.\n\nEntries are `(name|*.name|ip|cidr):(N|lo-hi|*)` in canonical form, else `422`. Names: lowercase A-labels of `a-z0-9-`, no edge hyphens, `--` only in a leading `xn--`, labels ≤ 63 and names ≤ 253 octets (`*.` included), no trailing dot, last label not all digits. IPv6 bracketed in RFC 5952 form, no zone or IPv4-mapped; IPv4 without leading zeros; split at the last `:`. CIDRs without host bits; full-length prefixes written as the address. Ports 1–65535 without leading zeros, `lo < hi`; `N-N` written `N`, `1-65535` written `*`.\n\nWrites apply atomically: on return, new connections and DNS use the new policy and flows it no longer authorizes are closed; a rejected write changes nothing. Pin expiry and host address changes re-check flows likewise. Processes that escaped a `BestEffort` teardown keep their old policy."
+      },
+      "NotFoundProblem": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://playpencil.dev/problems/not_found"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "NoticeEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A connection or DNS query was refused.",
+            "required": [
+              "details",
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "$ref": "#/components/schemas/DenyDetails"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "deny"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Addresses authorized for a name.",
+            "required": [
+              "details",
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "$ref": "#/components/schemas/PinRegisteredDetails"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "pin_registered"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Addresses no longer authorized.",
+            "required": [
+              "details",
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "$ref": "#/components/schemas/PinExpiredDetails"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "pin_expired"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Host addresses changed.",
+            "required": [
+              "details",
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "$ref": "#/components/schemas/HostAddressesChangedDetails"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "host_addresses_changed"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Ends the baseline, which follows any replay; later events are live.",
+            "required": [
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "resync"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "A stop or destroy killed before the guest flushed; recent writes may be lost.",
+            "required": [
+              "details",
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "$ref": "#/components/schemas/FlushIncompleteDetails"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "flush_incomplete"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Events were lost; always delivered.",
+            "required": [
+              "details",
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "$ref": "#/components/schemas/GapDetails"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "gap"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Unlisted code.",
+            "required": [
+              "code",
+              "seq",
+              "at"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "not": {
+                  "enum": [
+                    "deny",
+                    "pin_registered",
+                    "pin_expired",
+                    "host_addresses_changed",
+                    "resync",
+                    "flush_incomplete",
+                    "gap"
+                  ]
+                }
+              },
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "maximum": 9223372036854775807,
+                "minimum": 0
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "additionalProperties": true
+          }
+        ],
+        "description": "Typed by `code`."
+      },
+      "PatchConflictProblem": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://playpencil.dev/problems/conflict"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          },
+          "current_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "On a version mismatch.",
+            "maximum": 9223372036854775807,
+            "minimum": 0
+          },
+          "current_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` before the first commit."
+          },
+          "required_state": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason",
+            "description": "When `clear_reason` was missing."
+          }
+        },
+        "additionalProperties": true
+      },
+      "PatchSandboxRequest": {
+        "type": "object",
+        "required": [
+          "if_version"
+        ],
+        "properties": {
+          "if_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `version` last read.",
+            "maximum": 9223372036854775807,
+            "minimum": 0
+          },
+          "desired_state": {
+            "$ref": "#/components/schemas/DesiredState"
+          },
+          "clear_reason": {
+            "type": "string",
+            "description": "The `reason.id` being acknowledged."
+          },
+          "config": {
+            "$ref": "#/components/schemas/ConfigPatch"
+          }
+        },
+        "additionalProperties": true
+      },
+      "PinExpiredDetails": {
+        "type": "object",
+        "required": [
+          "name",
+          "addresses"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "PinRegisteredDetails": {
+        "type": "object",
+        "required": [
+          "name",
+          "addresses",
+          "ports",
+          "expires_at"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`N`, `lo-hi` or `*`."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "baseline": {
+            "type": "boolean",
+            "description": "`true` in the baseline."
+          }
+        },
+        "additionalProperties": true
+      },
+      "Problem": {
+        "type": "object",
+        "description": "Untyped; for unparseable requests.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "about:blank"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProcessConflictProblem": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://playpencil.dev/problems/conflict"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string",
+            "description": "Says when the sandbox isn't ready."
+          },
+          "current_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` before the first commit."
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProcessList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProcessRecord"
+            },
+            "description": "Includes the main process."
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProcessRecord": {
+        "type": "object",
+        "description": "A process in a sandbox. Records don't survive a daemon restart; processes do only if they escaped a `BestEffort` teardown. Output is never stored.",
+        "required": [
+          "id",
+          "boot",
+          "command_spec",
+          "state",
+          "interrupt_requested"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Never reused; also used on `/v1/streams`."
+          },
+          "boot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Boot incarnation.",
+            "maximum": 9223372036854775807,
+            "minimum": 0
+          },
+          "role": {
+            "type": "string",
+            "description": "`main` for the main process (current: highest `boot`)."
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Informational.",
+            "minimum": 0
+          },
+          "command_spec": {
+            "$ref": "#/components/schemas/CommandSpecRead"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProcessState"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Absent if not observed."
+          },
+          "exited_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Only for `exited`."
+          },
+          "interrupt_requested": {
+            "type": "boolean",
+            "description": "Stays set on a `running` process that can't be killed."
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProcessState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "code",
+              "kind"
+            ],
+            "properties": {
+              "code": {
+                "type": "integer",
+                "format": "int32"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "exited"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "message",
+              "kind"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "start_failed"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Outcome and liveness unknown.",
+            "required": [
+              "teardown",
+              "kind"
+            ],
+            "properties": {
+              "teardown": {
+                "type": "string",
+                "description": "`Strong`: gone. `BestEffort`: may still be alive."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "lost"
+                ]
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "description": "Unlisted kind.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "not": {
+                  "enum": [
+                    "running",
+                    "exited",
+                    "start_failed",
+                    "lost"
+                  ]
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        ]
+      },
+      "Provenance": {
+        "type": "object",
+        "required": [
+          "backend_id",
+          "version",
+          "build",
+          "os",
+          "kernel",
+          "schema"
+        ],
+        "properties": {
+          "backend_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "build": {
+            "type": "string"
+          },
+          "os": {
+            "type": "string"
+          },
+          "kernel": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "Reason": {
+        "type": "object",
+        "description": "Why `state` differs from `desired`. Latched: no action until acknowledged.",
+        "required": [
+          "id",
+          "code"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "description": "`provision_failed`, `start_failed`, `destroy_failed`, `crashed`, or `exited` (clean main-process exit)."
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "SandboxDocument": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "namespace",
+          "version",
+          "status",
+          "config"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bumped by every accepted write; send it as `if_version`.",
+            "maximum": 9223372036854775807,
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/Status"
+          },
+          "config": {
+            "$ref": "#/components/schemas/ConfigRead"
+          }
+        },
+        "additionalProperties": true
+      },
+      "SandboxList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SandboxDocument"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "Status": {
+        "type": "object",
+        "description": "`running` is set when compute is created. Converged: `state` equals `desired`, or a `reason` is set. After a daemon restart, a running sandbox becomes `stopped` with a `reason`.",
+        "required": [
+          "desired",
+          "state",
+          "created_at",
+          "last_transition_at"
+        ],
+        "properties": {
+          "desired": {
+            "type": "string",
+            "description": "`stopped`, `running` or `destroyed`."
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Same values, or `null` before the first commit."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_transition_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "`created_at` until the first change."
+          },
+          "teardown": {
+            "type": "string",
+            "description": "Teardown fidelity after `stopped` or `destroyed`."
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "sandboxes"
+    },
+    {
+      "name": "events"
+    },
+    {
+      "name": "processes"
+    },
+    {
+      "name": "streams"
+    },
+    {
+      "name": "system"
+    }
+  ]
+}

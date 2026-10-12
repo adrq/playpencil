@@ -6,6 +6,9 @@ mod exec;
 mod handlers;
 mod router;
 mod state;
+pub mod v1;
+
+pub use v1::openapi_json;
 
 use std::net::SocketAddr;
 

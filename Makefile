@@ -4,7 +4,7 @@ ifneq ($(wildcard $(LIBKRUN_DIR)/lib64/pkgconfig/libkrun.pc),)
   export LD_LIBRARY_PATH := $(abspath $(LIBKRUN_DIR))/lib64:$(LD_LIBRARY_PATH)
 endif
 
-.PHONY: all build check test test-rust test-vm test-ci pre-commit clean setup-libkrun
+.PHONY: all build check test test-rust test-vm test-ci pre-commit clean setup-libkrun openapi check-openapi
 
 all: build
 
@@ -39,6 +39,19 @@ pre-commit:
 
 setup-libkrun:
 	scripts/setup-libkrun.sh
+
+openapi:
+	mkdir -p openapi
+	cargo run -q -p playpencil-server --bin playpencil-openapi > openapi/v1.json.tmp || { rm -f openapi/v1.json.tmp; exit 1; }
+	mv openapi/v1.json.tmp openapi/v1.json
+
+check-openapi:
+	@tmp="$$(mktemp -d)" && trap 'rm -rf "$$tmp"' EXIT && \
+	cargo run -q -p playpencil-server --bin playpencil-openapi > "$$tmp/v1.json" && \
+	if ! cmp -s "$$tmp/v1.json" openapi/v1.json; then \
+		echo "openapi/v1.json is stale or missing: run make openapi" >&2; exit 1; \
+	fi
+	uv run python scripts/check_openapi_spec.py openapi/v1.json
 
 clean:
 	cargo clean

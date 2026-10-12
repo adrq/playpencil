@@ -28,6 +28,8 @@ futures-util = "0.3"
 tokio-util = "0.7"
 zstd = "0.13"
 url = "2"
+utoipa = { version = "6.0.0", features = ["preserve_order", "preserve_path_order"] }
+serde_with = { version = "3.24", default-features = false }
 
 [workspace.package]
 version = "0.1.0"

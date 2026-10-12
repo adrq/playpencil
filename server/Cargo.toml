@@ -16,6 +16,12 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+utoipa = { workspace = true }
+serde_with = { workspace = true }
+
+[[bin]]
+name = "playpencil-openapi"
+path = "src/bin/playpencil-openapi.rs"
 
 [dev-dependencies]
 tower = { workspace = true }
