@@ -155,6 +155,7 @@ pub(crate) async fn run_command<B: SandboxBackendSend + Sync + 'static>(
     let body = Body::from_stream(ReceiverStream::new(rx));
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
+        .extension(crate::drain::StreamResponse)
         .body(body)
         .expect("valid SSE response"))
 }

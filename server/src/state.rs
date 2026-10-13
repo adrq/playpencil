@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicBool;
 use playpencil_core::types::ExecCanceller;
 use tokio_util::sync::CancellationToken;
 
+use crate::drain::Admission;
+
 /// A live command's controller: a cancellation handle plus a first-cancel-wins
 /// latch so DELETE, the disconnect guard, and the timeout produce a single
 /// escalation owner.
@@ -51,12 +53,13 @@ impl LiveControlRegistry {
 
 pub(crate) struct AppState<B> {
     pub backend: Arc<B>,
-    // Cancelled when the server begins shutting down. Long-lived handlers (SSE
-    // streams) observe it so they end and let graceful shutdown drain.
+    // Cancelled once the drain has no admitted requests left. Long-lived
+    // handlers (SSE streams, exec faces) observe it and end.
     pub shutdown: CancellationToken,
     /// The daemon's bound address, surfaced in the discovery endpoint.
     pub public_addr: SocketAddr,
     pub live: Arc<LiveControlRegistry>,
+    pub admission: Arc<Admission>,
 }
 
 impl<B> Clone for AppState<B> {
@@ -66,6 +69,7 @@ impl<B> Clone for AppState<B> {
             shutdown: self.shutdown.clone(),
             public_addr: self.public_addr,
             live: self.live.clone(),
+            admission: self.admission.clone(),
         }
     }
 }
@@ -77,6 +81,7 @@ impl<B> AppState<B> {
             shutdown: CancellationToken::new(),
             public_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             live: Arc::new(LiveControlRegistry::default()),
+            admission: Admission::new(),
         }
     }
 

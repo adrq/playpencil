@@ -16,7 +16,6 @@ use crate::v1::types::capabilities::CapabilitiesResponse;
 pub(crate) async fn get_capabilities() {}
 
 /// Daemon liveness; no body.
-#[expect(dead_code)]
 #[utoipa::path(
     get,
     path = "/v1/health",
@@ -29,4 +28,8 @@ pub(crate) async fn get_capabilities() {}
         (status = 503, description = "Unhealthy."),
     ),
 )]
-pub(crate) async fn get_health() {}
+pub(crate) async fn get_health(
+    axum::extract::State(health): axum::extract::State<crate::health::HealthState>,
+) -> axum::http::StatusCode {
+    health.status().await
+}

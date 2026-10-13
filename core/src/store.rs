@@ -49,6 +49,10 @@ pub trait Store: Send + Sync {
     /// written. Used by recovery to commit the whole normalized map at once so
     /// a mid-recovery failure leaves no partial durable write.
     fn replace_all(&self, records: &[PersistedRecord]) -> io::Result<()>;
+
+    /// Checks that the store can be read and written now, without changing
+    /// any record.
+    fn probe(&self) -> io::Result<()>;
 }
 
 /// A single JSON file holding `id -> PersistedRecord`. Every write is a
@@ -123,17 +127,20 @@ impl JsonStore {
         // durability degradation, never as a rollback-safe "the write did not
         // happen" error — otherwise a caller would roll back in memory while
         // disk holds the new record.
-        if let Some(dir) = self.path.parent() {
-            let dir = if dir.as_os_str().is_empty() {
-                std::path::Path::new(".")
-            } else {
-                dir
-            };
-            if let Err(e) = std::fs::File::open(dir).and_then(|f| f.sync_all()) {
-                return Err(committed_unsynced_error(e));
-            }
-        }
-        Ok(())
+        self.sync_dir().map_err(committed_unsynced_error)
+    }
+
+    /// Fsyncs the directory holding the state file.
+    fn sync_dir(&self) -> io::Result<()> {
+        let Some(dir) = self.path.parent() else {
+            return Ok(());
+        };
+        let dir = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir).and_then(|f| f.sync_all())
     }
 }
 
@@ -268,6 +275,34 @@ impl Store for JsonStore {
         validate_map(&map)?;
         self.write_map(&map)
     }
+
+    /// Reads and validates the state file, creates, writes and removes a
+    /// temp file beside it with a directory fsync, then takes and releases
+    /// the store lock. The lock is never held across I/O.
+    fn probe(&self) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        validate_map(&self.read_map()?)?;
+
+        let tmp = self.unique_tmp_path();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let written = file.write_all(b"probe\n").and_then(|()| self.sync_dir());
+        drop(file);
+        let removed = std::fs::remove_file(&tmp);
+        written?;
+        removed?;
+
+        drop(
+            self.lock
+                .lock()
+                .map_err(|_| io::Error::other("store lock poisoned"))?,
+        );
+        Ok(())
+    }
 }
 
 /// Disk-free `Store` for the mock backend and reconciler unit tests.
@@ -319,6 +354,10 @@ impl Store for InMemoryStore {
             new_map.insert(r.id.clone(), r.clone());
         }
         *self.map.lock().unwrap() = new_map;
+        Ok(())
+    }
+
+    fn probe(&self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -1206,6 +1245,161 @@ mod tests {
         assert!(store.load_all().unwrap().is_empty());
         // A valid record upserts fine.
         assert!(store.upsert(&base("sb-1")).is_ok());
+    }
+
+    // --- Probe ----------------------------------------------------------------
+
+    fn is_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn set_mode(dir: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn probe_ok_on_fresh_and_populated_store() {
+        let dir = tempdir();
+        let store = JsonStore::new(dir.join("state.json"));
+        store.probe().unwrap();
+        store.upsert(&base("sb-1")).unwrap();
+        store.probe().unwrap();
+    }
+
+    #[test]
+    fn probe_fails_on_corrupt_state() {
+        let dir = tempdir();
+        std::fs::write(dir.join("state.json"), b"{not json").unwrap();
+        let store = JsonStore::new(dir.join("state.json"));
+        let err = store.probe().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("key must be a string"), "{err}");
+    }
+
+    #[test]
+    fn probe_fails_on_invalid_record() {
+        let dir = tempdir();
+        let mut map = BTreeMap::new();
+        map.insert("sb-1".to_string(), with_carrier(base("sb-1")));
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec_pretty(&map).unwrap(),
+        )
+        .unwrap();
+        let store = JsonStore::new(dir.join("state.json"));
+        let err = store.probe().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "entrypoint_exit present only on failed+crashed records"
+        );
+    }
+
+    #[test]
+    fn probe_fails_on_readonly_dir() {
+        if is_root() {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
+        let dir = tempdir();
+        let store = JsonStore::new(dir.join("state.json"));
+        store.upsert(&base("sb-1")).unwrap();
+        set_mode(&dir, 0o500);
+        let result = store.probe();
+        set_mode(&dir, 0o700);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(dir_entries(&dir), vec!["state.json"]);
+    }
+
+    #[test]
+    fn probe_fails_when_dir_sync_fails() {
+        if is_root() {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
+        let dir = tempdir();
+        let store = JsonStore::new(dir.join("state.json"));
+        store.upsert(&base("sb-1")).unwrap();
+        // Write and search permission without read: the temp can be created,
+        // but the directory cannot be opened for its fsync.
+        set_mode(&dir, 0o300);
+        let result = store.probe();
+        set_mode(&dir, 0o700);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(dir_entries(&dir), vec!["state.json"]);
+    }
+
+    #[test]
+    fn probe_leaves_state_unchanged() {
+        let dir = tempdir();
+        let store = JsonStore::new(dir.join("state.json"));
+        store.upsert(&base("sb-1")).unwrap();
+        store.upsert(&running("sb-2")).unwrap();
+        let before = std::fs::read(dir.join("state.json")).unwrap();
+        store.probe().unwrap();
+        assert_eq!(std::fs::read(dir.join("state.json")).unwrap(), before);
+        assert_eq!(dir_entries(&dir), vec!["state.json"]);
+    }
+
+    #[test]
+    fn probe_fails_when_store_mutex_poisoned() {
+        let dir = tempdir();
+        let store = std::sync::Arc::new(JsonStore::new(dir.join("state.json")));
+        let holder = store.clone();
+        let joined = std::thread::spawn(move || {
+            let _guard = holder.lock.lock().unwrap();
+            panic!("poison the store mutex");
+        })
+        .join();
+        assert!(joined.is_err());
+        let err = store.probe().unwrap_err();
+        assert_eq!(err.to_string(), "store lock poisoned");
+    }
+
+    #[test]
+    fn wedged_store_mutex_times_out_then_recovers() {
+        use crate::backend::health::{StoreProbe, Unhealthy};
+        use std::time::Duration;
+
+        let dir = tempdir();
+        let json = std::sync::Arc::new(JsonStore::new(dir.join("state.json")));
+        let store: std::sync::Arc<dyn Store> = json.clone();
+        let probe = StoreProbe::new(Duration::from_millis(200));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = json.clone();
+        let wedge = std::thread::spawn(move || {
+            let _guard = holder.lock.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+
+        let (first, second) =
+            rt.block_on(async { tokio::join!(probe.check(&store), probe.check(&store)) });
+        assert!(matches!(first, Err(Unhealthy::StoreTimeout)), "{first:?}");
+        assert!(matches!(second, Err(Unhealthy::StoreTimeout)), "{second:?}");
+        assert_eq!(probe.started(), 1);
+
+        release_tx.send(()).unwrap();
+        wedge.join().unwrap();
+        probe.wait_idle();
+        rt.block_on(probe.check(&store)).unwrap();
+        assert_eq!(probe.started(), 2);
     }
 
     fn tempdir() -> PathBuf {

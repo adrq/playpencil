@@ -855,6 +855,10 @@ impl KrunCtx {
             0 => {
                 std::mem::forget(self);
 
+                if !crate::lease::close_in_forked_child() {
+                    unsafe { libc::_exit(1) };
+                }
+
                 #[cfg(target_os = "linux")]
                 {
                     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {

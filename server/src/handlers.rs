@@ -7,14 +7,17 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use playpencil_core::backend::{BackendError, SandboxBackendSend};
 use playpencil_core::types::{
-    MountConfig, NetworkPolicy, ResourceLimits, SandboxConfig, SandboxId, validate_entrypoint,
+    MountConfig, NetworkPolicy, ResourceLimits, SandboxConfig, SandboxId, SandboxStatus,
+    validate_entrypoint,
 };
 
 use crate::adapter::{build_response, project_wire_state};
 use crate::api_types::{CreateSandboxRequest, ListParams, ListSandboxesResponse, SandboxResponse};
+use crate::drain::StreamResponse;
 use crate::error::{ApiError, ErrorResponse, ValidatedJson};
 use crate::state::AppState;
 
@@ -164,9 +167,7 @@ fn single_terminated_response(
         tokio_stream::iter(vec![Ok(terminated_event(id))]),
         shutdown.clone().cancelled_owned(),
     ));
-    Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+    sse_response(stream)
 }
 
 pub(crate) async fn sandbox_events<B: SandboxBackendSend + Sync + 'static>(
@@ -237,52 +238,108 @@ pub(crate) async fn sandbox_events<B: SandboxBackendSend + Sync + 'static>(
             .unwrap_or_else(|_| Event::default());
         let _ = tx.try_send(Ok(ev));
     }
-    let shutdown = state.shutdown.clone();
-    let stream_id = id.clone();
-    tokio::spawn(async move {
-        let mut rx = rx;
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                // Client disconnected (out_rx dropped): wake even on a quiet
-                // stream so the broadcast receiver is released promptly instead
-                // of leaking until the next event or server shutdown.
-                _ = tx.closed() => break,
-                msg = rx.recv() => match msg {
-                    Ok(status) => {
-                        let wire = project_wire_state(
-                            status.state,
-                            status.desired,
-                            status.generation,
-                            status.observed_generation,
-                        );
-                        let ev = Event::default()
-                            .event("state_change")
-                            .json_data(serde_json::json!({
-                                "sandbox_id": stream_id,
-                                "state": wire,
-                            }))
-                            .unwrap_or_else(|_| Event::default());
-                        if tx.send(Ok(ev)).await.is_err() {
+    tokio::spawn(forward_events(rx, tx, state.shutdown.clone(), id));
+    Ok(sse_response(event_body(out_rx, &state.shutdown)))
+}
+
+/// Forwards committed transitions to an SSE stream until a forwarded
+/// `Terminated`, the client disconnects, or `shutdown` is cancelled, including
+/// while waiting for room in the stream's channel.
+async fn forward_events(
+    mut rx: tokio::sync::broadcast::Receiver<SandboxStatus>,
+    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    shutdown: CancellationToken,
+    stream_id: String,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            // Client disconnected (out_rx dropped): wake even on a quiet
+            // stream so the broadcast receiver is released promptly instead
+            // of leaking until the next event or server shutdown.
+            _ = tx.closed() => break,
+            msg = rx.recv() => match msg {
+                Ok(status) => {
+                    let wire = project_wire_state(
+                        status.state,
+                        status.desired,
+                        status.generation,
+                        status.observed_generation,
+                    );
+                    let ev = Event::default()
+                        .event("state_change")
+                        .json_data(serde_json::json!({
+                            "sandbox_id": stream_id,
+                            "state": wire,
+                        }))
+                        .unwrap_or_else(|_| Event::default());
+                    let send = tx.send(Ok(ev));
+                    #[cfg(test)]
+                    let send = send_observer::observe(&stream_id, send);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        sent = send => if sent.is_err() {
                             break;
-                        }
-                        if wire == "Terminated" {
-                            break;
-                        }
+                        },
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(sandbox_id = %stream_id, "SSE subscriber lagged by {n}");
+                    if wire == "Terminated" {
+                        break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(sandbox_id = %stream_id, "SSE subscriber lagged by {n}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    }
+}
 
-    let stream: EventStream = Box::pin(ReceiverStream::new(out_rx));
-    Ok(Sse::new(stream)
+/// Records the streams whose event send has been polled while the channel was
+/// full.
+#[cfg(test)]
+mod send_observer {
+    use std::future::Future;
+    use std::sync::Mutex;
+
+    pub(super) static BLOCKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn observe<F: Future>(stream_id: &str, send: F) -> impl Future<Output = F::Output> {
+        let stream_id = stream_id.to_owned();
+        let mut send = Box::pin(send);
+        std::future::poll_fn(move |cx| {
+            let poll = send.as_mut().poll(cx);
+            if poll.is_pending() {
+                BLOCKED.lock().unwrap().push(stream_id.clone());
+            }
+            poll
+        })
+    }
+
+    pub(super) fn blocked(stream_id: &str) -> bool {
+        BLOCKED.lock().unwrap().iter().any(|id| id == stream_id)
+    }
+}
+
+/// The SSE body for `out_rx`, ending when `shutdown` is cancelled even if
+/// events remain buffered.
+fn event_body(
+    out_rx: tokio::sync::mpsc::Receiver<Result<Event, Infallible>>,
+    shutdown: &CancellationToken,
+) -> EventStream {
+    Box::pin(futures_util::StreamExt::take_until(
+        ReceiverStream::new(out_rx),
+        shutdown.clone().cancelled_owned(),
+    ))
+}
+
+/// An SSE response, marked as a stream for the admission gate.
+fn sse_response(stream: EventStream) -> axum::response::Response {
+    let mut resp = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response())
+        .into_response();
+    resp.extensions_mut().insert(StreamResponse);
+    resp
 }
 
 pub(crate) async fn pause_sandbox<B: SandboxBackendSend + Sync + 'static>(
@@ -328,6 +385,63 @@ mod tests {
     use playpencil_core::types::{NetworkPolicy, ResourceLimits, SandboxConfig};
 
     use crate::router::build_router;
+
+    fn status(id: &str, state: State) -> SandboxStatus {
+        SandboxStatus {
+            sandbox_id: SandboxId(id.into()),
+            state: Some(state),
+            desired: playpencil_core::lifecycle::DesiredState::Running,
+            generation: 1,
+            observed_generation: 1,
+            reason: None,
+            message: None,
+            created_at: None,
+            last_transition_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn events_producer_and_body_end_on_cancel_when_backed_up() {
+        let (status_tx, status_rx) = tokio::sync::broadcast::channel(8);
+        let (tx, out_rx) = tokio::sync::mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        let producer = tokio::spawn(forward_events(
+            status_rx,
+            tx.clone(),
+            shutdown.clone(),
+            "sb-backed-up".into(),
+        ));
+        // Fills the channel, blocks the producer in send, and leaves one pending.
+        for _ in 0..3 {
+            status_tx
+                .send(status("sb-backed-up", State::Running))
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !send_observer::blocked("sb-backed-up") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer never blocked in send");
+        assert_eq!(tx.capacity(), 0);
+        assert!(!producer.is_finished());
+        drop(tx);
+
+        let mut body = event_body(out_rx, &shutdown);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), producer)
+            .await
+            .expect("producer did not stop")
+            .unwrap();
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut body),
+        )
+        .await
+        .unwrap();
+        assert!(next.is_none(), "body yielded after cancel");
+    }
 
     fn test_config() -> SandboxConfig {
         SandboxConfig {

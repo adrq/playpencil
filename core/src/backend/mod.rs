@@ -1,3 +1,4 @@
+pub mod health;
 pub mod libkrun;
 pub mod mock;
 pub mod output;
@@ -79,4 +80,7 @@ pub trait SandboxBackend {
         id: &SandboxId,
     ) -> Result<tokio::sync::broadcast::Receiver<SandboxStatus>, BackendError>;
     fn capabilities(&self) -> Capabilities;
+    /// Whether the daemon can serve requests. Daemon-wide failures only: a
+    /// failed or poisoned individual sandbox does not make this an error.
+    async fn health(&self) -> Result<(), health::Unhealthy>;
 }

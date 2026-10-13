@@ -185,6 +185,13 @@ impl ForkSupervisor {
     }
 }
 
+impl ForkSupervisor {
+    /// Whether the supervisor thread is still running.
+    fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
 impl Drop for ForkSupervisor {
     fn drop(&mut self) {
         // Drop the sender so the recv loop ends, then join.
@@ -1335,6 +1342,7 @@ impl DriverFactory for LibkrunFactory {
 
 pub struct LibkrunBackend {
     runtime: ReconcileRuntime<LibkrunFactory>,
+    fork_supervisor: Arc<ForkSupervisor>,
     console_map: ConsoleMap,
     data_dir: PathBuf,
     next_exec: AtomicU64,
@@ -1354,6 +1362,7 @@ impl LibkrunBackend {
                 BackendError::Internal(format!("registry client: {e}"))
             })?));
         let console_map: ConsoleMap = Arc::new(RwLock::new(HashMap::new()));
+        let fork_supervisor = Arc::new(ForkSupervisor::new()?);
 
         let factory = LibkrunFactory {
             data_dir: data_dir.clone(),
@@ -1361,7 +1370,7 @@ impl LibkrunBackend {
             rootfs_provider,
             image_cache,
             registry_client,
-            fork_supervisor: Arc::new(ForkSupervisor::new()?),
+            fork_supervisor: fork_supervisor.clone(),
             launch_mutex: Arc::new(Mutex::new(())),
             console_map: console_map.clone(),
         };
@@ -1369,6 +1378,7 @@ impl LibkrunBackend {
 
         Ok(Self {
             runtime: ReconcileRuntime::new_recoverable(factory, store),
+            fork_supervisor,
             console_map,
             data_dir,
             next_exec: AtomicU64::new(1),
@@ -1537,6 +1547,11 @@ impl SandboxBackendSend for LibkrunBackend {
         self.runtime.subscribe(id)
     }
 
+    async fn health(&self) -> Result<(), super::health::Unhealthy> {
+        let supervisor = self.fork_supervisor.clone();
+        self.runtime.health(move || supervisor.is_alive()).await
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             hardware_isolation: true,
@@ -1549,6 +1564,18 @@ impl SandboxBackendSend for LibkrunBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_supervisor_reports_dead_after_thread_exit() {
+        let mut supervisor = ForkSupervisor::new().unwrap();
+        assert!(supervisor.is_alive());
+        supervisor.tx.take();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while supervisor.is_alive() {
+            assert!(std::time::Instant::now() < deadline, "thread did not exit");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Fork supervisor tests

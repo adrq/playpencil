@@ -105,7 +105,9 @@ pub(crate) async fn duplex<B: SandboxBackendSend + Sync + 'static>(
     let ws = ws
         .max_message_size(MAX_INBOUND_MESSAGE_BYTES)
         .max_frame_size(MAX_INBOUND_MESSAGE_BYTES);
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, id)))
+    let mut resp = ws.on_upgrade(move |socket| handle_socket(socket, state, id));
+    resp.extensions_mut().insert(crate::drain::StreamResponse);
+    Ok(resp)
 }
 
 async fn handle_socket<B: SandboxBackendSend + Sync + 'static>(

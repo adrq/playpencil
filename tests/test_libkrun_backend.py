@@ -8,17 +8,15 @@ import base64
 import http.client
 import json
 import os
-import queue
 import socket
 import struct
-import subprocess
-import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from conftest import ALPINE_IMAGE_BACKEND, DISTROLESS_IMAGE, seed_image_cache
+from testhelpers import start_serve
 
 
 class WSConn:
@@ -127,78 +125,14 @@ def server(tmp_path):
     data_dir.mkdir()
     seed_image_cache(data_dir)
 
-    proc = subprocess.Popen(
-        [
-            str(PLAYPENCIL_BIN),
-            "serve",
-            "--port",
-            "0",
-            "--bind",
-            "127.0.0.1",
-            "--data-dir",
-            str(data_dir),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    # Wait for the "listening on ..." line to discover the port.
-    # Use threads to avoid blocking indefinitely on readline, and to drain
-    # stderr continuously so the daemon never blocks on a full pipe buffer.
-    line_queue = queue.Queue()
-    stderr_chunks = []
-
-    def _read_stdout():
-        for raw_line in proc.stdout:
-            line_queue.put(raw_line.decode().strip())
-
-    def _read_stderr():
-        for raw_line in proc.stderr:
-            stderr_chunks.append(raw_line.decode())
-
-    reader_thread = threading.Thread(target=_read_stdout, daemon=True)
-    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-    reader_thread.start()
-    stderr_thread.start()
-
-    def _captured_stderr():
-        # Give the drainer a moment to flush; read the buffer it fills rather
-        # than proc.stderr directly (which would race the drainer thread).
-        stderr_thread.join(timeout=1)
-        return "".join(stderr_chunks)
-
-    port = None
-    deadline = time.monotonic() + 10
-    while port is None:
-        if proc.poll() is not None:
-            pytest.fail(f"playpencil daemon failed to start: {_captured_stderr()}")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            proc.terminate()
-            pytest.fail(
-                "playpencil daemon did not print listening line in time. "
-                f"stderr: {_captured_stderr()}"
-            )
-        try:
-            line = line_queue.get(timeout=min(remaining, 0.5))
-        except queue.Empty:
-            continue
-        if line.startswith("listening on "):
-            addr = line[len("listening on ") :]
-            port = int(addr.rsplit(":", 1)[1])
-
-    client = SandboxClient("127.0.0.1", port)
+    daemon = start_serve(data_dir)
+    client = SandboxClient("127.0.0.1", daemon.port)
     # Expose the daemon pid so tests can enumerate the VM child processes it forks
     # (each forked VM's parent is the daemon process).
-    client.daemon_pid = proc.pid
+    client.daemon_pid = daemon.pid
     yield client
 
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    daemon.stop()
 
 
 class SandboxClient:

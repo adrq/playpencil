@@ -2,6 +2,7 @@
 //! which the OpenAPI document is generated.
 
 mod ops;
+pub(crate) mod routes;
 mod types;
 
 use utoipa::OpenApi;

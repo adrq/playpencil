@@ -133,12 +133,21 @@ pub struct MockBackend {
 
 impl MockBackend {
     pub fn new() -> Self {
+        Self::with_runtime_store(Arc::new(InMemoryStore::new()))
+    }
+
+    /// A mock backend whose runtime persists to `store`.
+    #[cfg(feature = "test-util")]
+    pub fn with_store(store: Arc<dyn crate::store::Store>) -> Self {
+        Self::with_runtime_store(store)
+    }
+
+    fn with_runtime_store(store: Arc<dyn crate::store::Store>) -> Self {
         let base_dir = std::env::temp_dir().join(format!("pp-mock-{}", std::process::id()));
         let factory = MockFactory {
             base_dir,
             pid_counter: Arc::new(AtomicI32::new(1_000_000)),
         };
-        let store = Arc::new(InMemoryStore::new());
         Self {
             runtime: ReconcileRuntime::new(factory, store),
             next_exec: AtomicU64::new(1),
@@ -228,6 +237,10 @@ impl SandboxBackendSend for MockBackend {
         id: &SandboxId,
     ) -> Result<tokio::sync::broadcast::Receiver<SandboxStatus>, BackendError> {
         self.runtime.subscribe(id)
+    }
+
+    async fn health(&self) -> Result<(), super::health::Unhealthy> {
+        self.runtime.health(|| true).await
     }
 
     fn capabilities(&self) -> Capabilities {

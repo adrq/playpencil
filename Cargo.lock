@@ -1323,6 +1323,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1361,6 +1367,7 @@ dependencies = [
  "clap",
  "playpencil-core",
  "playpencil-server",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1410,6 +1417,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "http-body",
  "pipemux",
  "playpencil-core",
  "serde",
@@ -1421,6 +1429,7 @@ dependencies = [
  "tower",
  "tracing",
  "utoipa",
+ "utoipa-axum",
 ]
 
 [[package]]
@@ -2329,6 +2338,19 @@ dependencies = [
  "serde",
  "serde_json",
  "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-axum"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "865319162dc3d0032e1e40ed11bd49d5b78e8ef576740589fd6823e2e9977423"
+dependencies = [
+ "axum",
+ "pastey",
+ "tower-layer",
+ "tower-service",
+ "utoipa",
 ]
 
 [[package]]

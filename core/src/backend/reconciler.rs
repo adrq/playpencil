@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::BackendError;
+use super::health::{STORE_PROBE_DEADLINE, StoreProbe, Unhealthy};
 use crate::lifecycle::{
     DesiredState, FailureReason, ReconcileAction, State, Verb, next_action, precondition_ok,
 };
@@ -204,6 +205,7 @@ pub struct ReconcileRuntime<F: DriverFactory> {
     shutdown: CancellationToken,
     next_sandbox: AtomicU64,
     state: AtomicU8,
+    probe: StoreProbe,
 }
 
 impl<F: DriverFactory> ReconcileRuntime<F> {
@@ -228,7 +230,29 @@ impl<F: DriverFactory> ReconcileRuntime<F> {
             shutdown: CancellationToken::new(),
             next_sandbox: AtomicU64::new(1),
             state: AtomicU8::new(state),
+            probe: StoreProbe::new(STORE_PROBE_DEADLINE),
         }
+    }
+
+    /// Whether the runtime can serve: the store probe succeeds, recovery has
+    /// completed, the runtime is not shut down, and `supervisor_alive` holds.
+    /// The runtime and supervisor checks are evaluated after the probe returns.
+    /// Per-sandbox actor failures do not affect the result.
+    pub async fn health(
+        &self,
+        supervisor_alive: impl Fn() -> bool + Send,
+    ) -> Result<(), Unhealthy> {
+        self.probe.check(&self.store).await?;
+        if self.state.load(Ordering::Acquire) != STATE_READY {
+            return Err(Unhealthy::NotReady);
+        }
+        if self.shutdown.is_cancelled() {
+            return Err(Unhealthy::Shutdown);
+        }
+        if !supervisor_alive() {
+            return Err(Unhealthy::ForkSupervisorDown);
+        }
+        Ok(())
     }
 
     pub fn shutdown(&self) {
@@ -1266,6 +1290,7 @@ async fn drive_action<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::health::test_support::GateStore;
     use crate::store::InMemoryStore;
     use crate::types::{NetworkPolicy, ResourceLimits};
     use std::path::{Path, PathBuf};
@@ -1521,6 +1546,9 @@ mod tests {
         fn replace_all(&self, records: &[PersistedRecord]) -> io::Result<()> {
             self.inner.replace_all(records)
         }
+        fn probe(&self) -> io::Result<()> {
+            self.inner.probe()
+        }
     }
 
     /// Wraps an in-memory store and flags if any upsert ever persists a record
@@ -1550,6 +1578,9 @@ mod tests {
             }
             Ok(())
         }
+        fn probe(&self) -> io::Result<()> {
+            self.inner.probe()
+        }
     }
 
     /// Commits every write to an inner in-memory store, then reports a
@@ -1577,6 +1608,9 @@ mod tests {
             Err(crate::store::committed_unsynced_error(io::Error::other(
                 "dir fsync failed",
             )))
+        }
+        fn probe(&self) -> io::Result<()> {
+            self.inner.probe()
         }
     }
 
@@ -2002,6 +2036,100 @@ mod tests {
         assert_eq!(v.status.generation, 3);
         // No reprovision of a healthy stopped sandbox.
         assert_eq!(ctl.provisions.load(Ordering::Acquire), 0);
+    }
+
+    // --- Health -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn healthy_runtime_is_healthy() {
+        let rt = runtime(Ctl::default(), Arc::new(InMemoryStore::new()));
+        rt.health(|| true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_not_ready_before_recovery() {
+        let rt = recoverable_runtime(Ctl::default(), Arc::new(InMemoryStore::new()));
+        assert!(matches!(rt.health(|| true).await, Err(Unhealthy::NotReady)));
+        rt.recover().await.unwrap();
+        rt.health(|| true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_runtime_shutdown() {
+        let rt = runtime(Ctl::default(), Arc::new(InMemoryStore::new()));
+        rt.shutdown();
+        assert!(matches!(rt.health(|| true).await, Err(Unhealthy::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn health_reports_fork_supervisor_down() {
+        let rt = runtime(Ctl::default(), Arc::new(InMemoryStore::new()));
+        assert!(matches!(
+            rt.health(|| false).await,
+            Err(Unhealthy::ForkSupervisorDown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn health_reports_store_failure() {
+        let store = Arc::new(GateStore::default());
+        store.push_result(Err(io::Error::other("unwritable")));
+        store.open();
+        let rt = runtime(Ctl::default(), store);
+        let err = rt.health(|| true).await.unwrap_err();
+        assert_eq!(err.to_string(), "store probe failed: unwritable");
+    }
+
+    #[tokio::test]
+    async fn poisoned_actor_is_healthy() {
+        let rt = runtime(Ctl::default(), Arc::new(FaultStore::new(1)));
+        let id = rt.create(cfg(), DesiredState::Stopped).await.unwrap();
+        for _ in 0..400 {
+            if matches!(rt.status(&id), Err(BackendError::Internal(_))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(matches!(rt.status(&id), Err(BackendError::Internal(_))));
+        rt.health(|| true).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_down_during_probe_is_unhealthy() {
+        let store = Arc::new(GateStore::default());
+        let rt = Arc::new(runtime(Ctl::default(), store.clone()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let call = {
+            let (rt, alive) = (rt.clone(), alive.clone());
+            tokio::spawn(async move { rt.health(move || alive.load(Ordering::SeqCst)).await })
+        };
+        let waiter = store.clone();
+        tokio::task::spawn_blocking(move || waiter.wait_runs(1))
+            .await
+            .unwrap();
+        alive.store(false, Ordering::SeqCst);
+        store.open();
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(Unhealthy::ForkSupervisorDown)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_during_probe_is_unhealthy() {
+        let store = Arc::new(GateStore::default());
+        let rt = Arc::new(runtime(Ctl::default(), store.clone()));
+        let call = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.health(|| true).await })
+        };
+        let waiter = store.clone();
+        tokio::task::spawn_blocking(move || waiter.wait_runs(1))
+            .await
+            .unwrap();
+        rt.shutdown();
+        store.open();
+        assert!(matches!(call.await.unwrap(), Err(Unhealthy::Shutdown)));
     }
 
     #[tokio::test]

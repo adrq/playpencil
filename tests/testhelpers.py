@@ -8,11 +8,13 @@ temporary files to reduce duplication and flakiness across tests.
 from __future__ import annotations
 
 import os
+import queue
 import socket
 import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
 import httpx
@@ -298,3 +300,99 @@ def wait_for_port(port: int, timeout: float = 10, health_path: str = "/health") 
             pass
         time.sleep(0.1)
     return False
+
+
+PLAYPENCIL_BIN = Path(__file__).parent.parent / "bin" / "playpencil"
+
+
+class ServeProcess:
+    """A `playpencil serve` process with its stderr drained in the background."""
+
+    def __init__(self, proc: subprocess.Popen, lines: "queue.Queue[str]"):
+        self.proc = proc
+        self.port: int | None = None
+        self._lines = lines
+        self._stderr_chunks: List[str] = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    @property
+    def pid(self) -> int:
+        return self.proc.pid
+
+    def _drain_stderr(self) -> None:
+        for raw in self.proc.stderr:
+            self._stderr_chunks.append(raw.decode(errors="replace"))
+
+    def stderr(self) -> str:
+        """Stderr captured so far; complete once the process has exited."""
+        if self.proc.poll() is not None:
+            self._stderr_thread.join(timeout=5)
+        return "".join(self._stderr_chunks)
+
+    def wait_ready(self, timeout: float = 10.0) -> int:
+        """Wait for the `listening on` line and return the bound port."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"daemon not ready in time; stderr: {self.stderr()}"
+                )
+            try:
+                line = self._lines.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                if self.proc.poll() is not None and self._lines.empty():
+                    raise AssertionError(
+                        f"daemon exited {self.proc.returncode} before ready; "
+                        f"stderr: {self.stderr()}"
+                    )
+                continue
+            if line.startswith("listening on "):
+                self.port = int(line.rsplit(":", 1)[1])
+                return self.port
+
+    def wait_exit(self, timeout: float = 10.0) -> int:
+        """Wait for the process to exit and return its exit code."""
+        return self.proc.wait(timeout=timeout)
+
+    def stop(self) -> None:
+        """Terminate the process if it is still running."""
+        _terminate_single_process(self.proc)
+
+
+def spawn_serve(data_dir: Path) -> ServeProcess:
+    """Start `playpencil serve` on an ephemeral loopback port without waiting."""
+    proc = subprocess.Popen(
+        [
+            str(PLAYPENCIL_BIN),
+            "serve",
+            "--port",
+            "0",
+            "--bind",
+            "127.0.0.1",
+            "--data-dir",
+            str(data_dir),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    lines: "queue.Queue[str]" = queue.Queue()
+
+    def _read_stdout() -> None:
+        for raw in proc.stdout:
+            lines.put(raw.decode(errors="replace").strip())
+
+    threading.Thread(target=_read_stdout, daemon=True).start()
+    return ServeProcess(proc, lines)
+
+
+def start_serve(data_dir: Path, timeout: float = 10.0) -> ServeProcess:
+    """Start `playpencil serve` and wait until it is listening."""
+    daemon = spawn_serve(data_dir)
+    try:
+        daemon.wait_ready(timeout)
+    except BaseException:
+        daemon.stop()
+        raise
+    return daemon

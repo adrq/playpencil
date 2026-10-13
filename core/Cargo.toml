@@ -9,6 +9,10 @@ description = "Compute isolation layer — cross-platform VM sandbox for running
 name = "playpencil_core"
 crate-type = ["lib", "staticlib", "cdylib"]
 
+[features]
+# Test-support constructors for dependent crates' tests.
+test-util = []
+
 [dependencies]
 pipemux = { git = "https://github.com/adrq/pipemux", tag = "v0.1.0", features = ["relay", "consumer"] }
 serde = { workspace = true }

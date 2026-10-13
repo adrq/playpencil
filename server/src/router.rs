@@ -1,12 +1,34 @@
+use std::sync::Arc;
+
 use axum::Router;
 use axum::routing::{get, post};
 
 use playpencil_core::backend::SandboxBackendSend;
 
+use crate::drain::{self, Admission};
 use crate::endpoints;
 use crate::exec;
 use crate::handlers;
+use crate::health::HealthState;
 use crate::state::AppState;
+
+/// The complete application: every route behind the admission gate.
+pub(crate) fn build_app<B: SandboxBackendSend + Sync + 'static>(state: AppState<B>) -> Router {
+    let admission = state.admission.clone();
+    let health = HealthState::new(state.backend.clone(), admission.clone());
+    with_admission(
+        build_router(state).merge(crate::v1::routes::router(health)),
+        admission,
+    )
+}
+
+/// Wraps `router`, including its fallback, in the admission gate.
+pub(crate) fn with_admission(router: Router, admission: Arc<Admission>) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        admission,
+        drain::admit,
+    ))
+}
 
 pub(crate) fn build_router<B: SandboxBackendSend + Sync + 'static>(state: AppState<B>) -> Router {
     Router::new()
