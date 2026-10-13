@@ -14,8 +14,6 @@ build:
 	mkdir -p bin
 	cp target/release/playpencil bin/
 	cp target/x86_64-unknown-linux-musl/release/playpencil-init bin/
-	cp target/release/libplaypencil_core.so bin/
-	cp target/release/libplaypencil_core.a bin/
 
 check:
 	cargo check

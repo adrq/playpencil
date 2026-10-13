@@ -157,8 +157,6 @@ class SandboxClient:
     def create(
         self,
         image=ALPINE_IMAGE_BACKEND,
-        cpus=1,
-        memory_mb=256,
         network="isolated",
         entrypoint=None,
         env=None,
@@ -166,10 +164,6 @@ class SandboxClient:
     ):
         body = {
             "image": {"uri": image},
-            "resource_limits": {
-                "cpus": cpus,
-                "memory_bytes": memory_mb * 1024 * 1024,
-            },
             "mounts": mounts or [],
             "network": network,
             "env": env or {},
@@ -233,9 +227,6 @@ class SandboxClient:
                 events.append(json.loads(chunk))
         return status, events
 
-    def discover(self, sandbox_id, port):
-        return self._request("GET", f"/v1/sandboxes/{sandbox_id}/endpoints/{port}")
-
 
 @pytest.fixture
 def running_sandbox(server):
@@ -247,7 +238,7 @@ def running_sandbox(server):
 
 
 def test_vm_lifecycle(server):
-    """Create (accepted, reconciles to running) → stop → destroy.
+    """Create (accepted, reconciles to running) → stop → start → destroy.
 
     Lifecycle calls are accepted-not-converged, so each transition is observed
     by polling GET until the sandbox reaches the expected state.
@@ -258,12 +249,16 @@ def test_vm_lifecycle(server):
     server.stop(sid)
     server.wait_state(sid, "Stopped")
 
+    server.start(sid)
+    server.wait_state(sid, "Running")
+
     server.destroy(sid)
     server.wait_state(sid, "Terminated")
 
 
 def test_vm_survives_past_fork_keepalive(server):
-    """A running VM must outlive the fork thread's idle keep-alive window of 10s"""
+    """A running VM must outlive the fork thread's idle keep-alive window of 10s
+    and still execute commands."""
     sid = server.create()
     server.wait_state(sid, "Running")
     try:
@@ -273,6 +268,11 @@ def test_vm_survives_past_fork_keepalive(server):
             f"VM did not survive past the fork keep-alive window; "
             f"state is {state} (expected Running)"
         )
+        status, events = server.command(sid, "echo alive")
+        assert status == 200
+        assert any(e["type"] == "execution_complete" for e in events), events
+        stdout = "".join(e.get("text", "") for e in events if e["type"] == "stdout")
+        assert stdout.strip() == "alive"
     finally:
         server.destroy(sid)
 
@@ -337,30 +337,6 @@ def test_list_filter_by_state(server):
         server.destroy(sid)
 
 
-def test_pause_returns_501(running_sandbox, server):
-    status, body = server._request("POST", f"/v1/sandboxes/{running_sandbox}/pause")
-    assert status == 501
-    assert body["error"] == "not_implemented"
-
-
-def test_pause_nonexistent_returns_404(server):
-    status, body = server._request("POST", "/v1/sandboxes/bogus-id/pause")
-    assert status == 404
-    assert body["error"] == "not_found"
-
-
-def test_resume_returns_501(running_sandbox, server):
-    status, body = server._request("POST", f"/v1/sandboxes/{running_sandbox}/resume")
-    assert status == 501
-    assert body["error"] == "not_implemented"
-
-
-def test_resume_nonexistent_returns_404(server):
-    status, body = server._request("POST", "/v1/sandboxes/bogus-id/resume")
-    assert status == 404
-    assert body["error"] == "not_found"
-
-
 def test_create_invalid_mount_returns_422(server):
     """A bad mount is rejected as user input (422), not a server fault (500).
 
@@ -372,7 +348,6 @@ def test_create_invalid_mount_returns_422(server):
         "/v1/sandboxes",
         {
             "image": {"uri": ALPINE_IMAGE_BACKEND},
-            "resource_limits": {"cpus": 1, "memory_bytes": 256 * 1024 * 1024},
             "mounts": [
                 {
                     "host_path": "relative/path",
@@ -433,6 +408,30 @@ def test_command_face_unknown_sandbox_is_404(server):
     assert status == 404
 
 
+def test_command_face_invalid_env_key_rejected_before_running_gate(server):
+    """An invalid env key is 422 even on a stopped sandbox, where a valid command
+    is 409."""
+    sid = server.create()
+    try:
+        server.wait_state(sid, "Running")
+        server.stop(sid)
+        server.wait_state(sid, "Stopped")
+        path = f"/v1x/sandboxes/{sid}/execd/command"
+
+        status, body = server._request(
+            "POST", path, {"command": "echo hi", "envs": {"BAD=KEY": "v"}}
+        )
+        assert status == 422, (status, body)
+        assert body["error"] == "validation_error"
+        assert "env key must not contain '='" in body["detail"]
+
+        status, body = server._request("POST", path, {"command": "echo hi"})
+        assert status == 409, (status, body)
+        assert body["error"] == "invalid_state"
+    finally:
+        server.destroy(sid)
+
+
 def test_command_face_oversize_command_is_422(running_sandbox, server):
     """A command frame exceeding the 1 MiB console wire limit is malformed input
     (422 validation_error), not a server fault (500). Rejected before any guest
@@ -450,23 +449,6 @@ def test_command_face_oversize_command_is_422(running_sandbox, server):
     status, events = server.command(running_sandbox, "echo ok")
     assert status == 200
     assert any(e.get("type") == "execution_complete" for e in events), events
-
-
-def test_discovery_command_port(running_sandbox, server):
-    status, body = server.discover(running_sandbox, 44772)
-    assert status == 200
-    assert body["endpoint"].endswith(f"/v1x/sandboxes/{running_sandbox}/execd")
-    assert body["headers"]["X-EXECD-ACCESS-TOKEN"]
-
-
-def test_discovery_other_port_is_404(running_sandbox, server):
-    status, _ = server.discover(running_sandbox, 8080)
-    assert status == 404
-
-
-def test_discovery_unknown_sandbox_is_404(server):
-    status, _ = server.discover("bogus-id", 44772)
-    assert status == 404
 
 
 def test_duplex_cat_echo(running_sandbox, server):
@@ -673,7 +655,6 @@ def test_create_invalid_entrypoint_is_422(server):
         "/v1/sandboxes",
         {
             "image": {"uri": ALPINE_IMAGE_BACKEND},
-            "resource_limits": {"cpus": 1, "memory_bytes": 256 * 1024 * 1024},
             "mounts": [],
             "network": "isolated",
             "env": {},
@@ -715,46 +696,6 @@ def test_entrypoint_inherits_create_env_and_scrubs_reserved(server, tmp_path):
         # scrub must remove it (and every reserved var) before launching the child.
         assert "PLAYPENCIL_NET_MODE" not in env_text, env_text
         assert "PLAYPENCIL_" not in env_text, env_text
-    finally:
-        server.destroy(sid)
-
-
-def _decode_capture(path):
-    """Decode the internal entrypoint-capture.bin framing:
-    [stream:u8][len:u32-le][raw bytes]*, tolerating a truncated trailing record."""
-    data = path.read_bytes()
-    chunks = []
-    off = 0
-    while off + 5 <= len(data):
-        stream = data[off]
-        if stream not in (0, 1):
-            break
-        n = int.from_bytes(data[off + 1 : off + 5], "little")
-        start = off + 5
-        if start + n > len(data):
-            break
-        chunks.append((stream, data[start : start + n]))
-        off = start + n
-    return chunks
-
-
-def test_entrypoint_output_captured_to_durable_file(server, tmp_path):
-    """The main process's stdout is captured host-side to the durable capture file
-    and finalized before the controlled terminal. Read it back from the daemon's
-    data dir and decode the internal framing to confirm the bytes are retained —
-    including the TAIL (last write), pinning that the exit path drains the console
-    fully to the real Exit before finalizing (no dropped tail)."""
-    sid = server.create(
-        entrypoint=["sh", "-c", "printf 'START_MARKER '; printf 'END_MARKER\\n'"]
-    )
-    try:
-        # The entrypoint exits, coupling the VM to a terminal (Failed) state; the
-        # capture file is retained until destroy.
-        server.wait_state(sid, "Failed")
-        cap = tmp_path / "data" / "sessions" / sid / "entrypoint-capture.bin"
-        text = b"".join(b for _s, b in _decode_capture(cap)).decode(errors="replace")
-        assert "START_MARKER" in text, f"captured output missing; got {text!r}"
-        assert "END_MARKER" in text, f"capture dropped the tail; got {text!r}"
     finally:
         server.destroy(sid)
 

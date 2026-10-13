@@ -23,8 +23,8 @@ Always use these `make` targets rather than invoking `cargo` directly: they set 
 
 ## Project Structure
 
-- **core/** — Core library crate (`playpencil-core`: lifecycle, policy, backends, network backend, C ABI). The libkrun backend is a thin adapter over the `pipemux` relay engine.
-- **server/** — HTTP server crate (`playpencil-server`: OpenSandbox protocol, daemon runtime). The SSE/WS exec faces drive `pipemux`'s consumer-edge helpers.
+- **core/** — Core library crate (`playpencil-core`: lifecycle, policy, backends, network backend). The libkrun backend is a thin adapter over the `pipemux` relay engine.
+- **server/** — HTTP server crate (`playpencil-server`: lifecycle and exec routes, daemon runtime). The SSE/WS exec faces drive `pipemux`'s consumer-edge helpers.
 - **cli/** — CLI binary crate (`playpencil-cli`: serve + client subcommands)
 - **init/** — Guest init binary (`playpencil-init`: PID 1 inside VMs, exec handler over `pipemux`'s producer). Built as musl static.
 - **tests/** — Integration tests (Python)

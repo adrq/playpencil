@@ -11,22 +11,20 @@ use tokio_util::sync::CancellationToken;
 
 use playpencil_core::backend::{BackendError, SandboxBackendSend};
 use playpencil_core::types::{
-    MountConfig, NetworkPolicy, ResourceLimits, SandboxConfig, SandboxId, SandboxStatus,
-    validate_entrypoint,
+    MountConfig, NetworkPolicy, SandboxConfig, SandboxId, SandboxStatus, validate_entrypoint,
 };
 
 use crate::adapter::{build_response, project_wire_state};
 use crate::api_types::{CreateSandboxRequest, ListParams, ListSandboxesResponse, SandboxResponse};
 use crate::drain::StreamResponse;
-use crate::error::{ApiError, ErrorResponse, ValidatedJson};
+use crate::error::{ApiError, ValidatedJson};
 use crate::state::AppState;
 
 fn request_to_config(body: CreateSandboxRequest) -> Result<SandboxConfig, ApiError> {
     if body.image.uri.is_empty() {
         return Err(ApiError::Validation("image.uri must not be empty".into()));
     }
-    // Reject control chars before they reach the OCI pull / C boundary, where
-    // they risk silent CString truncation or framing breaks.
+    // Reject control characters in the image reference.
     if body.image.uri.chars().any(|c| c.is_ascii_control()) {
         return Err(ApiError::Validation(
             "image.uri must not contain control characters".into(),
@@ -39,11 +37,6 @@ fn request_to_config(body: CreateSandboxRequest) -> Result<SandboxConfig, ApiErr
     Ok(SandboxConfig {
         name: body.name,
         image: body.image.uri,
-        resource_limits: ResourceLimits {
-            cpus: body.resource_limits.cpus,
-            memory_bytes: body.resource_limits.memory_bytes,
-            disk_bytes: body.resource_limits.disk_bytes,
-        },
         mounts: body
             .mounts
             .into_iter()
@@ -342,36 +335,6 @@ fn sse_response(stream: EventStream) -> axum::response::Response {
     resp
 }
 
-pub(crate) async fn pause_sandbox<B: SandboxBackendSend + Sync + 'static>(
-    State(state): State<AppState<B>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    state.backend.status(&SandboxId(id)).await?;
-    Ok((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "not_implemented".into(),
-            detail: Some("pause is not supported".into()),
-            sandbox_id: None,
-        }),
-    ))
-}
-
-pub(crate) async fn resume_sandbox<B: SandboxBackendSend + Sync + 'static>(
-    State(state): State<AppState<B>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    state.backend.status(&SandboxId(id)).await?;
-    Ok((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: "not_implemented".into(),
-            detail: Some("resume is not supported".into()),
-            sandbox_id: None,
-        }),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,7 +345,7 @@ mod tests {
 
     use playpencil_core::backend::mock::MockBackend;
     use playpencil_core::lifecycle::State;
-    use playpencil_core::types::{NetworkPolicy, ResourceLimits, SandboxConfig};
+    use playpencil_core::types::{NetworkPolicy, SandboxConfig};
 
     use crate::router::build_router;
 
@@ -447,11 +410,6 @@ mod tests {
         SandboxConfig {
             name: None,
             image: "test:latest".into(),
-            resource_limits: ResourceLimits {
-                cpus: None,
-                memory_bytes: None,
-                disk_bytes: None,
-            },
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],

@@ -19,7 +19,6 @@ SEED="${PLAYPENCIL_TEST_IMAGE_CACHE:-$HOME/.cache/playpencil/test-images}"
 # minimal no-tail image used for image-independence is distroless/static.
 IMAGES=(
     "public.ecr.aws/docker/library/alpine@sha256:b58899f069c47216f6002a6850143dc6fae0d35eb8b0df9300bbe6327b9c2171"
-    "public.ecr.aws/docker/library/alpine@sha256:f27cad9117495d32d067133afff942cb2dc745dfe9163e949f6bfe8a6a245339"
     "gcr.io/distroless/static-debian12@sha256:7d14daf425206f9e79b463e57226c1d6500a6b42f4923d5f0a9a413657f5774f"
 )
 
@@ -55,7 +54,7 @@ for ref in "${IMAGES[@]}"; do
     echo "pulling $ref ..."
     id="$(curl -fsS -X POST "http://127.0.0.1:$PORT/v1/sandboxes" \
         -H 'Content-Type: application/json' \
-        -d "{\"image\":{\"uri\":\"$ref\"},\"resource_limits\":{\"cpus\":1,\"memory_bytes\":268435456},\"mounts\":[],\"network\":\"isolated\",\"env\":{}}" \
+        -d "{\"image\":{\"uri\":\"$ref\"},\"mounts\":[],\"network\":\"isolated\",\"env\":{}}" \
         | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
     [ -n "$id" ] || { echo "create did not return an id" >&2; exit 1; }
 

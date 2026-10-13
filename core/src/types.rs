@@ -2,10 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::{DesiredState, FailureReason, State};
 
-// The exec wire protocol, flow-control constants, command-interpretation mode,
-// and the shared ExecHandle type family now live in `pipemux`. Re-export
-// the pieces here so the long-standing `core::types::*` paths (used across core,
-// the server faces, and the C ABI) keep resolving.
+// Re-exports of the pipemux exec types used across the workspace.
 pub use pipemux::handle::{
     ExecCanceller, ExecControl, ExecEvent, ExecHandle, ExecId, ExecIo, ExecRequest,
 };
@@ -14,13 +11,6 @@ pub use pipemux::protocol::limits::STDIN_FRAME_RAW_MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceLimits {
-    pub cpus: Option<u32>,
-    pub memory_bytes: Option<u64>,
-    pub disk_bytes: Option<u64>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountConfig {
@@ -40,7 +30,6 @@ pub enum NetworkPolicy {
 pub struct SandboxConfig {
     pub name: Option<String>,
     pub image: String,
-    pub resource_limits: ResourceLimits,
     pub mounts: Vec<MountConfig>,
     pub network: NetworkPolicy,
     pub env: Vec<(String, String)>,
@@ -51,9 +40,8 @@ pub struct SandboxConfig {
     pub entrypoint: Option<Vec<String>>,
 }
 
-/// How a sandbox's main process finished, for backend-internal diagnostics. Held
-/// only on the durable record and read through a backend seam — never serialized
-/// onto the status wire (HTTP or C ABI).
+/// How a sandbox's main process finished. Held on the durable record and read
+/// through a backend method; never serialized onto the HTTP status wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntrypointExit {

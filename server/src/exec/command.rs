@@ -346,18 +346,6 @@ pub(crate) async fn delete_command<B: SandboxBackendSend + Sync + 'static>(
     }
 }
 
-/// Reserved 501 stub (sandbox resolved first → 404 before 501). The second path
-/// segment (a command id) is accepted but unused.
-pub(crate) async fn command_reserved_stub<B: SandboxBackendSend + Sync + 'static>(
-    State(state): State<AppState<B>>,
-    Path((id, _cmd)): Path<(String, String)>,
-) -> Result<Response, ApiError> {
-    state.backend.status(&SandboxId(id)).await?;
-    Err(ApiError::NotImplemented(
-        "this command surface is not supported".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,7 +403,7 @@ mod tests {
     use playpencil_core::backend::SandboxBackendSend;
     use playpencil_core::backend::mock::MockBackend;
     use playpencil_core::lifecycle::State as LifeState;
-    use playpencil_core::types::{NetworkPolicy, ResourceLimits, SandboxConfig};
+    use playpencil_core::types::{NetworkPolicy, SandboxConfig};
 
     use crate::router::build_router;
 
@@ -423,11 +411,6 @@ mod tests {
         SandboxConfig {
             name: None,
             image: "test:latest".into(),
-            resource_limits: ResourceLimits {
-                cpus: None,
-                memory_bytes: None,
-                disk_bytes: None,
-            },
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
@@ -520,7 +503,9 @@ mod tests {
     async fn not_running_sandbox_is_409() {
         let state = AppState::new(MockBackend::new());
         let backend = state.backend.clone();
-        let id = backend.create(cfg()).await.unwrap();
+        let id = backend.create_and_start(cfg()).await.unwrap();
+        await_state(&backend, &id, Some(LifeState::Running)).await;
+        backend.stop(&id).await.unwrap();
         await_state(&backend, &id, Some(LifeState::Stopped)).await;
         let app = build_router(state);
         let resp = app
@@ -555,33 +540,6 @@ mod tests {
         .expect("body ok");
         let text = String::from_utf8_lossy(&chunk);
         assert!(text.contains("\"type\":\"init\""), "got: {text:?}");
-    }
-
-    #[tokio::test]
-    async fn reserved_stub_unknown_is_404_known_is_501() {
-        let (app, id, _b) = running_router().await;
-        let unknown = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1x/sandboxes/nope/execd/command/status/x")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
-
-        let known = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/v1x/sandboxes/{}/execd/command/x/logs", id.0))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(known.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

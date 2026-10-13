@@ -68,11 +68,9 @@ pub trait RunningVmHandle {
     fn pid_start_time(&self) -> u64;
 }
 
-/// Accessors for a prepared rootfs. `rootfs_path` is the persisted mount/copy
-/// root; `session_dir` is its parent (the cleanup target).
+/// Accessor for a prepared rootfs; `rootfs_path` is its persisted mount/copy root.
 pub trait RootfsHandleExt {
     fn rootfs_path(&self) -> &std::path::Path;
-    fn session_dir(&self) -> &std::path::Path;
 }
 
 /// The only backend-specific surface. One driver instance is constructed per
@@ -1292,7 +1290,7 @@ mod tests {
     use super::*;
     use crate::backend::health::test_support::GateStore;
     use crate::store::InMemoryStore;
-    use crate::types::{NetworkPolicy, ResourceLimits};
+    use crate::types::NetworkPolicy;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -1300,11 +1298,6 @@ mod tests {
         SandboxConfig {
             name: None,
             image: "img".into(),
-            resource_limits: ResourceLimits {
-                cpus: None,
-                memory_bytes: None,
-                disk_bytes: None,
-            },
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],
@@ -1359,14 +1352,10 @@ mod tests {
 
     struct TestRootfs {
         root: PathBuf,
-        session: PathBuf,
     }
     impl RootfsHandleExt for TestRootfs {
         fn rootfs_path(&self) -> &Path {
             &self.root
-        }
-        fn session_dir(&self) -> &Path {
-            &self.session
         }
     }
 
@@ -1387,7 +1376,6 @@ mod tests {
             }
             Ok(TestRootfs {
                 root: self.session.join("rootfs"),
-                session: self.session.clone(),
             })
         }
 
@@ -1452,10 +1440,10 @@ mod tests {
             if self.ctl.rootfs_missing.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            Ok(record.rootfs_path.as_ref().map(|root| TestRootfs {
-                root: root.clone(),
-                session: self.session.clone(),
-            }))
+            Ok(record
+                .rootfs_path
+                .as_ref()
+                .map(|root| TestRootfs { root: root.clone() }))
         }
 
         fn is_alive(&self, vm: &mut TestVm) -> bool {

@@ -578,17 +578,12 @@ fn check_failed_rootfs(reason: FailureReason, has_rootfs: bool) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NetworkPolicy, ResourceLimits};
+    use crate::types::NetworkPolicy;
 
     fn cfg() -> SandboxConfig {
         SandboxConfig {
             name: Some("t".into()),
             image: "alpine".into(),
-            resource_limits: ResourceLimits {
-                cpus: None,
-                memory_bytes: None,
-                disk_bytes: None,
-            },
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],

@@ -11,7 +11,6 @@ use serde::Serialize;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::backend::output::{OutputCapture, OutputSnapshot, read_capture};
 use crate::backend::reconciler::{
     DriverFactory, EntrypointExitSink, ReconcileRuntime, RootfsHandleExt, RunningVmHandle,
     VmDriverSend,
@@ -228,10 +227,6 @@ const GUEST_INIT_PATH: &str = "/usr/local/bin/playpencil-init";
 /// for caller exec requests, so the two never collide on one console.
 const ENTRYPOINT_EXEC_ID: &str = "entrypoint";
 
-/// Capture file (session-dir-relative) for the main process's output. Internal
-/// binary framing read back through the `entrypoint_output` seam.
-const ENTRYPOINT_CAPTURE_FILE: &str = "entrypoint-capture.bin";
-
 /// How long a controlled shutdown waits for the guest to flush and self-exit
 /// after the console is closed, before the SIGKILL backstop fires.
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -239,10 +234,15 @@ const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the guest to self-exit.
 const GRACEFUL_EXIT_STEP: Duration = Duration::from_millis(50);
 
-/// Bound on how long a controlled teardown waits for the main-process consumer to
-/// drain remaining output into the capture file and finalize it, before the
-/// hard-abort backstop fires (so teardown never hangs).
+/// How long a controlled teardown waits for the main-process consumer to reach
+/// its terminal before aborting it.
 const CONSUMER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// vCPU count for every guest.
+const DEFAULT_VCPUS: u8 = 1;
+
+/// Guest RAM in MiB for every guest.
+const DEFAULT_RAM_MIB: u32 = 256;
 
 /// Standard environment variables injected into every guest.
 const GUEST_STANDARD_ENV: &[&str] = &[
@@ -358,81 +358,35 @@ fn wait_for_exit_or_kill(
     false
 }
 
-/// The capture sink the main-process consumer writes to. A trait so the
-/// finalize-on-terminal behaviour can be exercised with a recording double; the
-/// production impl is [`OutputCapture`].
-trait CaptureWriter: Send + 'static {
-    fn write_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()>;
-    fn write_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()>;
-    fn finalize(&mut self) -> std::io::Result<()>;
-}
-
-impl CaptureWriter for OutputCapture {
-    fn write_stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        OutputCapture::write_stdout(self, bytes)
-    }
-    fn write_stderr(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        OutputCapture::write_stderr(self, bytes)
-    }
-    fn finalize(&mut self) -> std::io::Result<()> {
-        OutputCapture::finalize(self)
-    }
-}
-
-/// Drain the main process's exec events: append output to the durable capture
-/// file (releasing flow-control credit after each write) and, on the real
-/// terminal, finalize (fsync) the capture and report the outcome so the host can
-/// couple the VM down. Finalizing BEFORE the report keeps the capture durable no
-/// later than the paired terminal record. The suppression latch makes a
-/// synthetic/forced terminal (teardown or crash) report nothing, so it never
-/// manufactures a bogus exit carrier. A mid-run capture write or finalize error
-/// never wedges the workload: draining and credit release continue.
-async fn run_entrypoint_consumer<C: CaptureWriter>(
+/// Drains the main process's exec events, releasing flow-control credit for each
+/// output chunk. On the terminal, posts the outcome unless the suppression latch
+/// is set.
+async fn run_entrypoint_consumer(
     mut events: tokio::sync::mpsc::Receiver<ExecEvent>,
     io: ExecIo,
-    mut capture: C,
     sink: EntrypointExitSink,
     terminal_untrusted: Arc<AtomicBool>,
 ) {
     while let Some(event) = events.recv().await {
         match event {
-            ExecEvent::Stdout(bytes) => {
-                let n = bytes.len();
-                let _ = capture.write_stdout(&bytes);
-                io.release_credit(n);
-            }
-            ExecEvent::Stderr(bytes) => {
-                let n = bytes.len();
-                let _ = capture.write_stderr(&bytes);
-                io.release_credit(n);
+            ExecEvent::Stdout(bytes) | ExecEvent::Stderr(bytes) => {
+                io.release_credit(bytes.len());
             }
             ExecEvent::Exit { code } => {
-                // Drained to the terminal: make the captured output durable, then
-                // report the outcome only if this is a TRUSTED (real) terminal. A
-                // suppressed terminal (controlled teardown / crash) still drains +
-                // finalizes the output — lossless — but never posts a carrier.
-                finalize_capture(&mut capture);
+                // Post only a trusted terminal; a suppressed one (teardown or
+                // crash) posts nothing.
                 if !terminal_untrusted.load(Ordering::Acquire) {
                     sink.post(EntrypointExit::Exited { code }).await;
                 }
                 return;
             }
             ExecEvent::StartError(message) => {
-                finalize_capture(&mut capture);
                 if !terminal_untrusted.load(Ordering::Acquire) {
                     sink.post(EntrypointExit::StartError { message }).await;
                 }
                 return;
             }
         }
-    }
-}
-
-/// Finalize the capture on the controlled exit path, surfacing a failure as a
-/// warning rather than wedging the workload or silently swallowing it.
-fn finalize_capture<C: CaptureWriter>(capture: &mut C) {
-    if let Err(e) = capture.finalize() {
-        tracing::warn!("entrypoint capture finalize failed: {e}");
     }
 }
 
@@ -501,9 +455,8 @@ fn validate_mounts(mounts: &[MountConfig]) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// Validate the image reference is well-formed. Done in `create` so a malformed
-/// ref is a caller error (InvalidInput → 4xx) rather than surfacing later as an
-/// internal reconcile failure.
+/// Checks that the image reference parses; a malformed reference is
+/// `InvalidInput`. Called by `create_and_start`.
 fn validate_image_ref(image: &str) -> Result<(), BackendError> {
     let _: ImageReference = image.parse().map_err(|e| {
         BackendError::InvalidInput(format!("invalid image reference '{image}': {e}"))
@@ -533,6 +486,15 @@ fn validate_env(env: &[(String, String)]) -> Result<(), BackendError> {
         }
     }
     Ok(())
+}
+
+/// Rejects a gid without a uid, and env entries with an empty key, NUL, or '='
+/// in the key.
+fn check_exec_request(req: &ExecRequest) -> Result<(), BackendError> {
+    if req.gid.is_some() && req.uid.is_none() {
+        return Err(BackendError::InvalidInput("gid requires uid".into()));
+    }
+    validate_env(&req.env)
 }
 
 /// Write /etc/playpencil/mounts.json into the rootfs.
@@ -612,14 +574,7 @@ async fn prepare_krun(
             let mut krun = KrunCtx::new()
                 .map_err(|e| BackendError::Internal(format!("krun_create_ctx: {e}")))?;
 
-            let cpus = cfg.resource_limits.cpus.unwrap_or(1).min(u8::MAX as u32) as u8;
-            let ram_mib = cfg
-                .resource_limits
-                .memory_bytes
-                .map(|b| (b / (1024 * 1024)) as u32)
-                .unwrap_or(256);
-
-            krun.set_vm_config(cpus, ram_mib)
+            krun.set_vm_config(DEFAULT_VCPUS, DEFAULT_RAM_MIB)
                 .map_err(|e| BackendError::Internal(format!("set_vm_config: {e}")))?;
 
             krun.set_root(&rootfs_root)
@@ -722,9 +677,9 @@ pub struct LibkrunRunningVm {
     mux: ExecMuxHost,
     console_map: ConsoleMap,
     id: SandboxId,
-    /// The run-scoped main-process consumer (capture writer + exit coupling), so
-    /// it unwinds with the VM. Fenced before any teardown can inject a synthetic
-    /// terminal, so the consumer never manufactures a bogus exit carrier.
+    /// The run-scoped main-process consumer, which reports the main process's
+    /// exit. Fenced before teardown injects a synthetic terminal, so a forced
+    /// terminal is never reported as an exit.
     consumer_task: Option<JoinHandle<()>>,
     /// Set the instant the VM is observed dead, or any teardown/drop begins —
     /// before any synthetic terminal can be produced. The consumer suppresses its
@@ -733,10 +688,8 @@ pub struct LibkrunRunningVm {
 }
 
 impl LibkrunRunningVm {
-    /// Fence the main-process consumer: stop it before any synthetic terminal can
-    /// reach it, so it never reports a forced/teardown terminal as a real exit.
-    /// LOSSY (it may abort the consumer mid-drain) — used by the immediate-kill
-    /// `stop` path; the controlled/lossless path uses `drain_consumer` instead.
+    /// Sets the suppression latch and aborts the main-process consumer. Used by
+    /// the immediate-kill `stop` path; `graceful_shutdown` uses `drain_consumer`.
     async fn fence_consumer(&mut self) {
         self.terminal_untrusted.store(true, Ordering::Release);
         if let Some(task) = self.consumer_task.take() {
@@ -745,11 +698,9 @@ impl LibkrunRunningVm {
         }
     }
 
-    /// Controlled drain of the main-process consumer: the suppression latch is
-    /// already set (caller), so the consumer drains any already-host-side output
-    /// into the capture file and finalizes it, then exits on the (synthetic)
-    /// terminal WITHOUT posting a carrier. Awaited so the drain completes;
-    /// hard-aborts only as a bounded backstop so teardown never hangs.
+    /// Waits for the main-process consumer to reach its terminal (the latch is
+    /// already set, so it posts nothing), aborting it after
+    /// `CONSUMER_DRAIN_TIMEOUT`.
     async fn drain_consumer(&mut self) {
         if let Some(task) = self.consumer_task.take() {
             let abort = task.abort_handle();
@@ -773,10 +724,9 @@ impl RunningVmHandle for LibkrunRunningVm {
 }
 
 impl LibkrunRunningVm {
-    /// Kill the VM (verifying the PID first), drain run-scoped I/O and network
-    /// resources, and drop the published console channel. Best-effort. The
-    /// immediate-kill path used by `stop` (no guest flush). For a lossless
-    /// teardown the driver runs `graceful_shutdown` first.
+    /// Kills the VM (verifying the PID first), drains run-scoped I/O and network
+    /// resources, and drops the published console channel. Best-effort, with no
+    /// guest flush. Used by `stop`; teardown runs `graceful_shutdown` first.
     async fn shutdown(mut self) {
         // Fence the main-process consumer before any synthetic terminal so it
         // never reports a forced terminal as a real exit.
@@ -855,15 +805,11 @@ impl Drop for LibkrunRunningVm {
 /// `cleanup_session_dir`, so no provider handle is retained.
 pub struct LibkrunRootfsHandle {
     root: PathBuf,
-    session_dir: PathBuf,
 }
 
 impl RootfsHandleExt for LibkrunRootfsHandle {
     fn rootfs_path(&self) -> &Path {
         &self.root
-    }
-    fn session_dir(&self) -> &Path {
-        &self.session_dir
     }
 }
 
@@ -946,11 +892,7 @@ impl VmDriverSend for LibkrunDriver {
         // The provider handle is inert (no Drop, PathBuf-only cleanup state);
         // the mount/copy lives on disk and is torn down via cleanup_session_dir.
         let root = prepared.root.clone();
-        let session_dir = root
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.clone());
-        Ok(LibkrunRootfsHandle { root, session_dir })
+        Ok(LibkrunRootfsHandle { root })
     }
 
     async fn start(
@@ -1083,11 +1025,11 @@ impl VmDriverSend for LibkrunDriver {
             terminal_untrusted: Arc::new(AtomicBool::new(false)),
         };
 
-        // Launch the main process (if any) as a normal exec and spawn its capture
-        // + exit-coupling consumer. An idle box (no entrypoint) opens no exec.
+        // Launch the main process (if any) as a normal exec with its
+        // exit-reporting consumer. An idle sandbox (no entrypoint) opens no exec.
         if let Some(entrypoint) = cfg.entrypoint.clone()
             && let Err(e) = self
-                .launch_entrypoint(&mut vm, entrypoint, rootfs.session_dir(), entrypoint_exit)
+                .launch_entrypoint(&mut vm, entrypoint, entrypoint_exit)
                 .await
         {
             vm.shutdown().await;
@@ -1102,16 +1044,14 @@ impl VmDriverSend for LibkrunDriver {
     }
 
     async fn graceful_shutdown(&self, vm: &mut Self::RunningVm) {
-        // (a) suppress any terminal REPORT (no bogus carrier), but DON'T abort the
-        // consumer yet — the controlled path is lossless, so it must keep draining
-        // already-host-side output into the capture file.
+        // (a) Suppress any terminal report without aborting the consumer.
         vm.terminal_untrusted.store(true, Ordering::Release);
         // (b) cancel the relays and send the engine teardown. This injects a
         // synthetic terminal AFTER any queued output (relay FIFO), so the consumer
         // drains all staged output before it sees the terminal.
         vm.mux.shutdown().await;
-        // Let the consumer drain the remaining output into capture + finalize, then
-        // exit on the terminal without posting (latch is set). Bounded backstop.
+        // Wait for the consumer to reach the terminal; it posts nothing because
+        // the latch is set. Bounded.
         vm.drain_consumer().await;
         // (c) await the I/O task so the console transport actually drops and the
         // guest observes the hangup BEFORE we start waiting for it to self-exit.
@@ -1159,8 +1099,7 @@ impl VmDriverSend for LibkrunDriver {
         rootfs: Option<Self::RootfsHandle>,
     ) -> Result<(), (BackendError, Option<Self::RootfsHandle>)> {
         if let Some(mut vm) = vm {
-            // Lossless destroy: flush the guest via the graceful primitive, then
-            // drop the (now inert) handle.
+            // Flush the guest via the graceful primitive, then drop the inert handle.
             self.graceful_shutdown(&mut vm).await;
             drop(vm);
         }
@@ -1205,8 +1144,7 @@ impl VmDriverSend for LibkrunDriver {
         if !root.exists() {
             return Ok(None);
         }
-        let session_dir = sessions_root.join(&self.id.0);
-        Ok(Some(LibkrunRootfsHandle { root, session_dir }))
+        Ok(Some(LibkrunRootfsHandle { root }))
     }
 
     fn is_alive(&self, vm: &mut Self::RunningVm) -> bool {
@@ -1226,22 +1164,16 @@ impl VmDriverSend for LibkrunDriver {
 }
 
 impl LibkrunDriver {
-    /// Open the sandbox's main process as a normal exec and spawn its capture +
-    /// exit-coupling consumer onto the VM handle. Every fallible step returns
-    /// `Err` without wiring the VM, so the caller's post-fork `shutdown()` unwinds
-    /// the whole VM with nothing left half-attached.
+    /// Opens the sandbox's main process as a normal exec and spawns its
+    /// exit-reporting consumer onto the VM handle. Every fallible step returns
+    /// `Err` without wiring the VM, so the caller's `shutdown()` unwinds the whole
+    /// VM.
     async fn launch_entrypoint(
         &self,
         vm: &mut LibkrunRunningVm,
         entrypoint: Vec<String>,
-        session_dir: &Path,
         sink: EntrypointExitSink,
     ) -> Result<(), BackendError> {
-        // Build + size-check the frame and OPEN the exec FIRST, BEFORE touching the
-        // capture file. A pre-launch failure (oversized frame, mux closing) must
-        // leave any prior run's capture intact — only a launch that crosses the
-        // "this run exists" boundary (a successful open) truncates it.
-        //
         // Argv-only frame with NO env: the child inherits init's environ, which
         // already carries the standard guest vars + the create env. cwd "/" and no
         // uid/gid (it runs as the main process).
@@ -1277,15 +1209,8 @@ impl LibkrunDriver {
                 }
             })?;
 
-        // The exec is now registered with the guest (we have crossed the
-        // "this run exists" boundary): truncate + open the capture file for this
-        // run. Output the guest produces before the consumer spawns is staged in
-        // the relay's per-id buffer (bounded by the output-credit window), so the
-        // brief gap loses nothing.
-        let capture_path = session_dir.join(ENTRYPOINT_CAPTURE_FILE);
-        let capture = OutputCapture::create(&capture_path)
-            .map_err(|e| BackendError::Internal(format!("open capture file: {e}")))?;
-
+        // Output produced before the consumer spawns is held in the relay's per-id
+        // buffer, bounded by the output-credit window.
         let (events, io) = handle.split();
         // The main process is non-interactive: signal EOF at the start so a child
         // reading stdin sees a clean end rather than blocking forever.
@@ -1293,7 +1218,6 @@ impl LibkrunDriver {
         let consumer = tokio::spawn(run_entrypoint_consumer(
             events,
             io,
-            capture,
             sink,
             vm.terminal_untrusted.clone(),
         ));
@@ -1344,7 +1268,6 @@ pub struct LibkrunBackend {
     runtime: ReconcileRuntime<LibkrunFactory>,
     fork_supervisor: Arc<ForkSupervisor>,
     console_map: ConsoleMap,
-    data_dir: PathBuf,
     next_exec: AtomicU64,
 }
 
@@ -1380,18 +1303,8 @@ impl LibkrunBackend {
             runtime: ReconcileRuntime::new_recoverable(factory, store),
             fork_supervisor,
             console_map,
-            data_dir,
             next_exec: AtomicU64::new(1),
         })
-    }
-
-    /// The session-dir capture file for a sandbox's main process output. Derived
-    /// from the validated id + data_dir, never a stored path.
-    fn capture_path(&self, id: &SandboxId) -> PathBuf {
-        self.data_dir
-            .join("sessions")
-            .join(&id.0)
-            .join(ENTRYPOINT_CAPTURE_FILE)
     }
 
     /// Reconstruct sandbox actors from the durable store. Run inside a Tokio
@@ -1413,14 +1326,6 @@ impl Drop for LibkrunBackend {
 }
 
 impl SandboxBackendSend for LibkrunBackend {
-    async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
-        validate_image_ref(&config.image)?;
-        validate_mounts(&config.mounts)?;
-        validate_env(&config.env)?;
-        validate_entrypoint(config.entrypoint.as_deref()).map_err(BackendError::InvalidInput)?;
-        self.runtime.create(config, DesiredState::Stopped).await
-    }
-
     async fn create_and_start(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
         validate_image_ref(&config.image)?;
         validate_mounts(&config.mounts)?;
@@ -1453,19 +1358,9 @@ impl SandboxBackendSend for LibkrunBackend {
 
     async fn exec(&self, id: &SandboxId, req: ExecRequest) -> Result<ExecHandle, BackendError> {
         let view = self.runtime.status(id)?;
-        // Shared backstop for ALL callers (FFI/direct core, not just the HTTP/WS
-        // adapters): credential drop is driven by uid, so a gid without a uid
-        // would be silently ignored. Reject it (after the sandbox resolves, so an
-        // unknown id is still 404) before requiring the running state or
-        // dispatching to the guest.
-        if req.gid.is_some() && req.uid.is_none() {
-            return Err(BackendError::InvalidInput("gid requires uid".into()));
-        }
-        // Validate env at the same boundary (NUL / empty key / '=' in key) so a
-        // malformed entry is a clean InvalidInput here rather than a guest-side
-        // start error after the command was already accepted, or a key silently
-        // re-split by putenv.
-        validate_env(&req.env)?;
+        // Input checks run after the sandbox resolves and before the frame size
+        // check, the running-state check, or any guest dispatch.
+        check_exec_request(&req)?;
 
         // Build and size-check the exec frame as INPUT VALIDATION: its size is
         // driven by user input (command/cwd/env), so an oversized request is
@@ -1520,20 +1415,6 @@ impl SandboxBackendSend for LibkrunBackend {
         id: &SandboxId,
     ) -> Result<Option<EntrypointExit>, BackendError> {
         self.runtime.entrypoint_exit(id)
-    }
-
-    async fn entrypoint_output(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Option<OutputSnapshot>, BackendError> {
-        // Resolve the sandbox first so an unknown id is NotFound, then read the
-        // durable on-disk capture (survives terminal + daemon restart).
-        self.runtime.status(id)?;
-        let path = self.capture_path(id);
-        tokio::task::spawn_blocking(move || read_capture(&path))
-            .await
-            .map_err(|e| BackendError::Internal(format!("read capture task: {e}")))?
-            .map_err(|e| BackendError::Internal(format!("read capture file: {e}")))
     }
 
     async fn list(&self) -> Result<Vec<SandboxView>, BackendError> {
@@ -1730,6 +1611,23 @@ mod tests {
         assert!(validate_env(&env).is_ok());
     }
 
+    #[test]
+    fn check_exec_request_rejects_gid_without_uid() {
+        let req = |uid, gid| ExecRequest {
+            command: vec!["id".into()],
+            working_dir: None,
+            env: vec![],
+            uid,
+            gid,
+            mode: ExecMode::default(),
+        };
+        assert!(matches!(
+            check_exec_request(&req(None, Some(5))),
+            Err(BackendError::InvalidInput(m)) if m == "gid requires uid"
+        ));
+        assert!(check_exec_request(&req(Some(5), Some(5))).is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // Graceful-shutdown self-exit-vs-backstop ordering
     // -----------------------------------------------------------------------
@@ -1773,23 +1671,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Main-process consumer: capture + suppression latch
+    // Main-process consumer: exit report + suppression latch
     // -----------------------------------------------------------------------
 
-    fn consumer_capture_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("pp-consumer-{}-{tag}.bin", std::process::id()))
-    }
-
     #[tokio::test]
-    async fn consumer_captures_output_and_reports_real_exit() {
+    async fn consumer_reports_real_exit() {
         use crate::backend::reconciler::{EntrypointExitSink, entrypoint_exited_outcome};
-        let path = consumer_capture_path("real");
         let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ExecEvent>(8);
         let (_dead, io) = ExecHandle::for_mock(ExecId("e".into())).split();
-        let capture = OutputCapture::create(&path).unwrap();
         let (sink, mut rx) = EntrypointExitSink::channel();
         let latch = Arc::new(AtomicBool::new(false));
-        let consumer = tokio::spawn(run_entrypoint_consumer(events_rx, io, capture, sink, latch));
+        let consumer = tokio::spawn(run_entrypoint_consumer(events_rx, io, sink, latch));
 
         events_tx
             .send(ExecEvent::Stdout(b"hi".to_vec()))
@@ -1803,25 +1695,18 @@ mod tests {
             entrypoint_exited_outcome(rx.recv().await.unwrap()),
             Some(EntrypointExit::Exited { code: 7 })
         );
-        // Output was captured byte-exact.
-        let snap = read_capture(&path).unwrap().unwrap();
-        assert_eq!(snap.chunks.len(), 1);
-        assert_eq!(snap.chunks[0].bytes, b"hi");
-        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
     async fn consumer_suppresses_terminal_when_untrusted() {
         use crate::backend::reconciler::EntrypointExitSink;
-        let path = consumer_capture_path("untrusted");
         let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ExecEvent>(8);
         let (_dead, io) = ExecHandle::for_mock(ExecId("e".into())).split();
-        let capture = OutputCapture::create(&path).unwrap();
         let (sink, mut rx) = EntrypointExitSink::channel();
         // Latch set BEFORE the terminal arrives (the teardown/crash signature): a
         // synthetic exit must NOT manufacture a carrier.
         let latch = Arc::new(AtomicBool::new(true));
-        let consumer = tokio::spawn(run_entrypoint_consumer(events_rx, io, capture, sink, latch));
+        let consumer = tokio::spawn(run_entrypoint_consumer(events_rx, io, sink, latch));
 
         events_tx.send(ExecEvent::Exit { code: -1 }).await.unwrap();
         consumer.await.unwrap();
@@ -1829,81 +1714,6 @@ mod tests {
             rx.try_recv().is_err(),
             "an untrusted terminal must not post an exit"
         );
-        std::fs::remove_file(&path).ok();
-    }
-
-    /// A capture double that records the order of operations, so a test can assert
-    /// finalize is invoked on the controlled terminal (after the output writes).
-    struct RecordingCapture {
-        ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
-    }
-    impl CaptureWriter for RecordingCapture {
-        fn write_stdout(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
-            self.ops.lock().unwrap().push("stdout");
-            Ok(())
-        }
-        fn write_stderr(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
-            self.ops.lock().unwrap().push("stderr");
-            Ok(())
-        }
-        fn finalize(&mut self) -> std::io::Result<()> {
-            self.ops.lock().unwrap().push("finalize");
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn consumer_finalizes_capture_before_real_terminal() {
-        use crate::backend::reconciler::{EntrypointExitSink, entrypoint_exited_outcome};
-        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = RecordingCapture { ops: ops.clone() };
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ExecEvent>(8);
-        let (_dead, io) = ExecHandle::for_mock(ExecId("e".into())).split();
-        let (sink, mut rx) = EntrypointExitSink::channel();
-        let latch = Arc::new(AtomicBool::new(false));
-        let consumer = tokio::spawn(run_entrypoint_consumer(events_rx, io, capture, sink, latch));
-
-        events_tx
-            .send(ExecEvent::Stdout(b"x".to_vec()))
-            .await
-            .unwrap();
-        events_tx.send(ExecEvent::Exit { code: 0 }).await.unwrap();
-        consumer.await.unwrap();
-
-        // The capture is finalized exactly once on the terminal, after the output
-        // writes — and (being synchronous) before the outcome is posted.
-        assert_eq!(*ops.lock().unwrap(), vec!["stdout", "finalize"]);
-        assert_eq!(
-            entrypoint_exited_outcome(rx.recv().await.unwrap()),
-            Some(EntrypointExit::Exited { code: 0 })
-        );
-    }
-
-    #[tokio::test]
-    async fn consumer_drains_output_and_finalizes_but_suppresses_post() {
-        // On a SUPPRESSED terminal (controlled teardown), the consumer must still
-        // drain preceding output into the capture AND finalize it (lossless), and
-        // ONLY skip posting a carrier. This is the lossless-controlled-teardown
-        // contract the destroy path relies on.
-        use crate::backend::reconciler::EntrypointExitSink;
-        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = RecordingCapture { ops: ops.clone() };
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ExecEvent>(8);
-        let (_dead, io) = ExecHandle::for_mock(ExecId("e".into())).split();
-        let (sink, mut rx) = EntrypointExitSink::channel();
-        let latch = Arc::new(AtomicBool::new(true)); // suppressed (teardown)
-        let consumer = tokio::spawn(run_entrypoint_consumer(events_rx, io, capture, sink, latch));
-
-        events_tx
-            .send(ExecEvent::Stdout(b"queued".to_vec()))
-            .await
-            .unwrap();
-        events_tx.send(ExecEvent::Exit { code: -1 }).await.unwrap();
-        consumer.await.unwrap();
-
-        // Output is drained to capture and finalized — but no carrier is posted.
-        assert_eq!(*ops.lock().unwrap(), vec!["stdout", "finalize"]);
-        assert!(rx.try_recv().is_err(), "suppressed terminal must not post");
     }
 
     // -----------------------------------------------------------------------
@@ -1976,12 +1786,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn graceful_shutdown_drains_output_and_finalizes_without_posting() {
-        // A CONTROLLED teardown of a box with host-side output must drain it into
-        // the capture and finalize (run the consumer THROUGH the terminal), NOT
-        // abort the consumer pre-terminal — while still suppressing the carrier.
-        // Recording `finalize` is the deterministic abort-vs-drain discriminator:
-        // the old (abort) path never reaches the terminal, so it never finalizes.
+    async fn graceful_shutdown_drains_consumer_without_posting() {
+        // A controlled teardown runs the consumer through the (synthetic) terminal
+        // rather than aborting it, and posts no carrier.
         use crate::backend::reconciler::EntrypointExitSink;
         use tokio::io::AsyncWriteExt;
 
@@ -2007,35 +1814,25 @@ mod tests {
             .unwrap();
         let (events, io) = handle.split();
 
-        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = RecordingCapture { ops: ops.clone() };
         let (sink, mut rx) = EntrypointExitSink::channel();
         let latch = Arc::new(AtomicBool::new(false));
-        let consumer = tokio::spawn(run_entrypoint_consumer(
-            events,
-            io,
-            capture,
-            sink,
-            latch.clone(),
-        ));
+        let returned = Arc::new(AtomicBool::new(false));
+        let consumer = {
+            let latch = latch.clone();
+            let returned = returned.clone();
+            tokio::spawn(async move {
+                run_entrypoint_consumer(events, io, sink, latch).await;
+                returned.store(true, Ordering::Release);
+            })
+        };
 
-        // The guest emits stdout (base64 of "hello") that crosses host-side.
+        // The guest emits stdout (base64 of "hello") ahead of the teardown.
         guest.set_nonblocking(true).unwrap();
         let guest = tokio::net::UnixStream::from_std(guest).unwrap();
         let (_gr, mut gw) = guest.into_split();
         gw.write_all(b"{\"type\":\"stdout\",\"id\":\"entrypoint\",\"data\":\"aGVsbG8=\"}\n")
             .await
             .unwrap();
-        for _ in 0..400 {
-            if ops.lock().unwrap().contains(&"stdout") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            ops.lock().unwrap().contains(&"stdout"),
-            "guest output should reach the capture host-side"
-        );
 
         let console_map: ConsoleMap = Arc::new(RwLock::new(HashMap::new()));
         let id = SandboxId("sb-x".into());
@@ -2058,14 +1855,71 @@ mod tests {
         let driver = test_driver(tmp.path(), id);
         driver.graceful_shutdown(&mut vm).await;
 
-        let recorded = ops.lock().unwrap().clone();
         assert!(
-            recorded.contains(&"finalize"),
-            "controlled teardown must drain to the terminal + finalize, not abort: {recorded:?}"
+            returned.load(Ordering::Acquire),
+            "controlled teardown must drain the consumer to its terminal, not abort it"
         );
         assert!(
             rx.try_recv().is_err(),
             "controlled teardown must not post a carrier"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn teardown_fails_first_stdin_write_on_live_exec() {
+        let (host, _guest) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        let host = tokio::net::UnixStream::from_std(host).unwrap();
+        let (hr, hw) = host.into_split();
+        let (mux, io_task) = spawn_mux(hr, hw);
+
+        let exec_json = serde_json::to_string(&HostFrame::Exec {
+            id: "exec-1".to_string(),
+            cmd: vec!["cat".to_string()],
+            env: vec![],
+            workdir: None,
+            uid: None,
+            gid: None,
+            mode: ExecMode::default(),
+        })
+        .unwrap();
+        let handle = mux
+            .open(ExecId("exec-1".to_string()), exec_json)
+            .await
+            .unwrap();
+        let (_events, io) = handle.split();
+        assert_eq!(
+            io.write_stdin(b"x").await,
+            Ok(()),
+            "live exec accepts stdin"
+        );
+
+        let console_map: ConsoleMap = Arc::new(RwLock::new(HashMap::new()));
+        let id = SandboxId("sb-x".into());
+        console_map.write().unwrap().insert(id.clone(), mux.clone());
+        let fake_pid = 0x7fff_fffe;
+        let vm = LibkrunRunningVm {
+            pid: fake_pid,
+            pid_start_time: 0,
+            child_guard: ChildGuard::new(fake_pid, 0),
+            net_handle: None,
+            io_task: Some(io_task),
+            mux,
+            console_map,
+            id: id.clone(),
+            consumer_task: None,
+            terminal_untrusted: Arc::new(AtomicBool::new(false)),
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver(tmp.path(), id);
+        assert!(driver.teardown(Some(vm), None).await.is_ok());
+
+        assert_eq!(
+            io.write_stdin(b"x").await,
+            Err(()),
+            "the first stdin write after teardown must fail"
         );
     }
 
@@ -2078,11 +1932,6 @@ mod tests {
         SandboxConfig {
             name: None,
             image: "alpine".into(),
-            resource_limits: crate::types::ResourceLimits {
-                cpus: None,
-                memory_bytes: None,
-                disk_bytes: None,
-            },
             mounts: vec![],
             network: NetworkPolicy::Isolated,
             env: vec![],

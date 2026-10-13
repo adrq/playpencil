@@ -21,7 +21,6 @@ DESTROYED_STORE = {
         "config": {
             "name": None,
             "image": "alpine",
-            "resource_limits": {"cpus": None, "memory_bytes": None, "disk_bytes": None},
             "mounts": [],
             "network": "Isolated",
             "env": [],
@@ -126,7 +125,6 @@ def test_sandbox_processes_do_not_hold_lease_fd(tmp_path):
             f"{base}/v1/sandboxes",
             json={
                 "image": {"uri": ALPINE_IMAGE_BACKEND},
-                "resource_limits": {"cpus": 1, "memory_bytes": 256 * 1024 * 1024},
                 "mounts": [],
                 "network": "isolated",
                 "env": {},

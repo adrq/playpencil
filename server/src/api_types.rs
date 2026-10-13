@@ -8,8 +8,6 @@ use crate::adapter::NetworkPolicyWire;
 pub(crate) struct CreateSandboxRequest {
     pub image: ImageWire,
     #[serde(default)]
-    pub resource_limits: ResourceLimitsWire,
-    #[serde(default)]
     pub mounts: Vec<MountConfigWire>,
     #[serde(default = "default_network")]
     pub network: NetworkPolicyWire,
@@ -29,13 +27,6 @@ pub(crate) struct ImageWire {
 
 fn default_network() -> NetworkPolicyWire {
     NetworkPolicyWire::Simple("isolated".into())
-}
-
-#[derive(Deserialize, Default)]
-pub(crate) struct ResourceLimitsWire {
-    pub cpus: Option<u32>,
-    pub memory_bytes: Option<u64>,
-    pub disk_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]

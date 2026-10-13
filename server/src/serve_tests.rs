@@ -19,7 +19,7 @@ use tower::ServiceExt;
 use playpencil_core::backend::SandboxBackendSend;
 use playpencil_core::backend::health::Unhealthy;
 use playpencil_core::backend::mock::MockBackend;
-use playpencil_core::types::{NetworkPolicy, ResourceLimits, SandboxConfig, SandboxId};
+use playpencil_core::types::{NetworkPolicy, SandboxConfig, SandboxId};
 
 use crate::drain::Admission;
 use crate::health::HealthState;
@@ -34,11 +34,6 @@ fn config() -> SandboxConfig {
     SandboxConfig {
         name: None,
         image: "test:latest".into(),
-        resource_limits: ResourceLimits {
-            cpus: None,
-            memory_bytes: None,
-            disk_bytes: None,
-        },
         mounts: vec![],
         network: NetworkPolicy::Isolated,
         env: vec![],
@@ -65,7 +60,7 @@ impl Server {
     ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = AppState::new(backend).with_public_addr(addr);
+        let state = AppState::new(backend);
         let admission = state.admission.clone();
         let shutdown = state.shutdown.clone();
         let backend = state.backend.clone();
@@ -207,7 +202,7 @@ async fn drain_refuses_unknown_path_and_method_with_bare_503() {
 async fn drain_refuses_new_streams_with_bare_503() {
     let state = AppState::new(TestBackend::default());
     let admission = state.admission.clone();
-    let id = state.backend.create(config()).await.unwrap();
+    let id = state.backend.create_and_start(config()).await.unwrap();
     let app = build_app(state);
     admission.begin_drain();
 
@@ -340,7 +335,7 @@ async fn drain_existing_events_open_until_admitted_done() {
         ..TestBackend::default()
     })
     .await;
-    let id: SandboxId = server.backend.create(config()).await.unwrap();
+    let id: SandboxId = server.backend.create_and_start(config()).await.unwrap();
 
     let mut events = send_request(
         server.addr,

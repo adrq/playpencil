@@ -1,7 +1,6 @@
 mod adapter;
 mod api_types;
 mod drain;
-mod endpoints;
 mod error;
 mod exec;
 mod handlers;
@@ -45,11 +44,11 @@ pub async fn run_server<B: SandboxBackendSend + Sync + 'static>(
 ) -> std::io::Result<()> {
     let signal = shutdown_signal()?;
 
-    // Bind first so the discovery endpoint can surface the real bound address.
+    // Bind before building the router; the readiness line prints the bound address.
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let state = AppState::new(backend).with_public_addr(local_addr);
+    let state = AppState::new(backend);
 
     println!("listening on {local_addr}");
 

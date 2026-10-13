@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -56,8 +55,6 @@ pub(crate) struct AppState<B> {
     // Cancelled once the drain has no admitted requests left. Long-lived
     // handlers (SSE streams, exec faces) observe it and end.
     pub shutdown: CancellationToken,
-    /// The daemon's bound address, surfaced in the discovery endpoint.
-    pub public_addr: SocketAddr,
     pub live: Arc<LiveControlRegistry>,
     pub admission: Arc<Admission>,
 }
@@ -67,7 +64,6 @@ impl<B> Clone for AppState<B> {
         Self {
             backend: self.backend.clone(),
             shutdown: self.shutdown.clone(),
-            public_addr: self.public_addr,
             live: self.live.clone(),
             admission: self.admission.clone(),
         }
@@ -79,14 +75,8 @@ impl<B> AppState<B> {
         Self {
             backend: Arc::new(backend),
             shutdown: CancellationToken::new(),
-            public_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             live: Arc::new(LiveControlRegistry::default()),
             admission: Admission::new(),
         }
-    }
-
-    pub fn with_public_addr(mut self, addr: SocketAddr) -> Self {
-        self.public_addr = addr;
-        self
     }
 }

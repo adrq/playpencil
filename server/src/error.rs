@@ -60,8 +60,8 @@ pub(crate) struct ErrorResponse {
 pub(crate) enum ApiError {
     Backend(BackendError),
     Validation(String),
-    /// A valid-but-unsupported feature (reserved surfaces, `background:true`).
-    /// Resolved only after a successful sandbox lookup, so it never masks a 404.
+    /// A valid but unsupported request option (`background:true` on the command
+    /// route). Returned only after the sandbox lookup succeeds.
     NotImplemented(String),
     StatusQueryFailed {
         sandbox_id: String,

@@ -13,7 +13,7 @@ use super::reconciler::{
     DriverFactory, EntrypointExitSink, ReconcileRuntime, RootfsHandleExt, RunningVmHandle,
     VmDriverSend,
 };
-use super::{BackendError, Capabilities, OutputSnapshot, SandboxBackendSend};
+use super::{BackendError, Capabilities, SandboxBackendSend};
 
 /// In-memory driver: provisioning and VM lifecycle are instant no-ops, with a
 /// flippable liveness flag for crash simulation.
@@ -34,15 +34,11 @@ impl RunningVmHandle for MockRunningVm {
 
 pub struct MockRootfsHandle {
     root: PathBuf,
-    session_dir: PathBuf,
 }
 
 impl RootfsHandleExt for MockRootfsHandle {
     fn rootfs_path(&self) -> &std::path::Path {
         &self.root
-    }
-    fn session_dir(&self) -> &std::path::Path {
-        &self.session_dir
     }
 }
 
@@ -61,7 +57,6 @@ impl VmDriverSend for MockDriver {
     ) -> Result<Self::RootfsHandle, BackendError> {
         Ok(MockRootfsHandle {
             root: self.session_dir.join("rootfs"),
-            session_dir: self.session_dir.clone(),
         })
     }
 
@@ -97,13 +92,10 @@ impl VmDriverSend for MockDriver {
         &self,
         record: &PersistedRecord,
     ) -> Result<Option<Self::RootfsHandle>, BackendError> {
-        Ok(record.rootfs_path.as_ref().map(|root| MockRootfsHandle {
-            root: root.clone(),
-            session_dir: root
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.session_dir.clone()),
-        }))
+        Ok(record
+            .rootfs_path
+            .as_ref()
+            .map(|root| MockRootfsHandle { root: root.clone() }))
     }
 
     fn is_alive(&self, vm: &mut Self::RunningVm) -> bool {
@@ -168,11 +160,6 @@ impl Drop for MockBackend {
 }
 
 impl SandboxBackendSend for MockBackend {
-    async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
-        validate_entrypoint(config.entrypoint.as_deref()).map_err(BackendError::InvalidInput)?;
-        self.runtime.create(config, DesiredState::Stopped).await
-    }
-
     async fn create_and_start(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
         validate_entrypoint(config.entrypoint.as_deref()).map_err(BackendError::InvalidInput)?;
         self.runtime.create(config, DesiredState::Running).await
@@ -218,16 +205,6 @@ impl SandboxBackendSend for MockBackend {
         self.runtime.entrypoint_exit(id)
     }
 
-    async fn entrypoint_output(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Option<OutputSnapshot>, BackendError> {
-        // The mock runs no real process, so there is no captured output. Resolve
-        // the sandbox first so an unknown id is still NotFound.
-        self.runtime.status(id)?;
-        Ok(None)
-    }
-
     async fn list(&self) -> Result<Vec<SandboxView>, BackendError> {
         Ok(self.runtime.list())
     }
@@ -262,11 +239,6 @@ mod tests {
         SandboxConfig {
             name: None,
             image: "test:latest".into(),
-            resource_limits: crate::types::ResourceLimits {
-                cpus: None,
-                memory_bytes: None,
-                disk_bytes: None,
-            },
             mounts: vec![],
             network: crate::types::NetworkPolicy::Isolated,
             env: vec![],
@@ -289,13 +261,22 @@ mod tests {
         panic!("timed out waiting for {want:?}, last was {got:?}");
     }
 
+    /// Create a running sandbox, then stop it and wait for `Stopped`.
+    async fn create_stopped(backend: &MockBackend) -> SandboxId {
+        let id = backend.create_and_start(test_config()).await.unwrap();
+        await_state(backend, &id, Some(State::Running)).await;
+        backend.stop(&id).await.unwrap();
+        await_state(backend, &id, Some(State::Stopped)).await;
+        id
+    }
+
     #[tokio::test]
-    async fn create_returns_unique_ids_and_converges_to_stopped() {
+    async fn create_and_start_returns_unique_ids() {
         let backend = MockBackend::new();
-        let id1 = backend.create(test_config()).await.unwrap();
-        let id2 = backend.create(test_config()).await.unwrap();
+        let id1 = backend.create_and_start(test_config()).await.unwrap();
+        let id2 = backend.create_and_start(test_config()).await.unwrap();
         assert_ne!(id1, id2);
-        await_state(&backend, &id1, Some(State::Stopped)).await;
+        await_state(&backend, &id1, Some(State::Running)).await;
     }
 
     #[tokio::test]
@@ -308,8 +289,7 @@ mod tests {
     #[tokio::test]
     async fn start_then_stop() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         backend.start(&id).await.unwrap();
         await_state(&backend, &id, Some(State::Running)).await;
         backend.stop(&id).await.unwrap();
@@ -319,8 +299,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_is_retained_as_destroyed() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         backend.destroy(&id).await.unwrap();
         await_state(&backend, &id, Some(State::Destroyed)).await;
         // Record retained, not NotFound.
@@ -331,8 +310,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_status_reflects_intent_before_convergence() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         backend.start(&id).await.unwrap();
         // Immediately after the accepted ack, desired is Running and durable.
         let view = backend.status(&id).await.unwrap();
@@ -342,8 +320,7 @@ mod tests {
     #[tokio::test]
     async fn start_rejected_when_being_destroyed() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         backend.destroy(&id).await.unwrap();
         let result = backend.start(&id).await;
         assert!(matches!(result, Err(BackendError::InvalidState)));
@@ -366,8 +343,7 @@ mod tests {
     #[tokio::test]
     async fn exec_requires_running() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         let req = ExecRequest {
             command: vec!["echo".into()],
             working_dir: None,
@@ -397,8 +373,7 @@ mod tests {
     #[tokio::test]
     async fn list_includes_created_sandbox() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         let list = backend.list().await.unwrap();
         assert!(list.iter().any(|v| v.status.sandbox_id == id));
     }
@@ -406,8 +381,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_receives_running_transition() {
         let backend = MockBackend::new();
-        let id = backend.create(test_config()).await.unwrap();
-        await_state(&backend, &id, Some(State::Stopped)).await;
+        let id = create_stopped(&backend).await;
         let mut rx = backend.subscribe(&id).unwrap();
         backend.start(&id).await.unwrap();
         // The Running transition is broadcast by the actor after convergence.

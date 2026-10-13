@@ -1,10 +1,7 @@
 pub mod health;
 pub mod libkrun;
 pub mod mock;
-pub mod output;
 pub mod reconciler;
-
-pub use output::{OutputChunk, OutputSnapshot, OutputStream};
 
 use crate::types::{
     EntrypointExit, ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus, SandboxView,
@@ -43,7 +40,7 @@ pub struct Capabilities {
 
 /// Accepted-not-converged lifecycle backend.
 ///
-/// `create`/`start`/`stop`/`destroy` return once the new intent is durably
+/// `create_and_start`/`start`/`stop`/`destroy` return once the new intent is durably
 /// persisted (accepted), NOT once the sandbox converges. Provision and start
 /// failures surface asynchronously as `state == Failed` via `status`, never as
 /// a return error. A destroyed sandbox's record is retained (reported as
@@ -51,9 +48,6 @@ pub struct Capabilities {
 /// that never existed.
 #[trait_variant::make(SandboxBackendSend: Send)]
 pub trait SandboxBackend {
-    /// Genesis with `desired = Stopped`; returns once the genesis record is
-    /// durably persisted.
-    async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError>;
     /// Genesis with `desired = Running` (durable run-intent before provisioning).
     async fn create_and_start(&self, config: SandboxConfig) -> Result<SandboxId, BackendError>;
     async fn start(&self, id: &SandboxId) -> Result<(), BackendError>;
@@ -67,13 +61,6 @@ pub trait SandboxBackend {
     /// retained. Backend-internal diagnostics, distinct from `status`.
     async fn entrypoint_exit(&self, id: &SandboxId)
     -> Result<Option<EntrypointExit>, BackendError>;
-    /// A decoded, full-retention snapshot of the main process's captured output.
-    /// `None` when the backend captures nothing (e.g. the mock) or no run has
-    /// produced output. Non-streaming.
-    async fn entrypoint_output(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Option<OutputSnapshot>, BackendError>;
     /// Subscribe to committed `state` transitions for one sandbox.
     fn subscribe(
         &self,

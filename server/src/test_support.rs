@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 
 use playpencil_core::backend::health::Unhealthy;
 use playpencil_core::backend::mock::MockBackend;
-use playpencil_core::backend::{BackendError, Capabilities, OutputSnapshot, SandboxBackendSend};
+use playpencil_core::backend::{BackendError, Capabilities, SandboxBackendSend};
 use playpencil_core::store::{InMemoryStore, PersistedRecord, Store};
 use playpencil_core::types::{
     EntrypointExit, ExecHandle, ExecRequest, SandboxConfig, SandboxId, SandboxStatus, SandboxView,
@@ -74,9 +74,6 @@ impl Store for BlockingStore {
 }
 
 impl SandboxBackendSend for TestBackend {
-    async fn create(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
-        self.inner.create(config).await
-    }
     async fn create_and_start(&self, config: SandboxConfig) -> Result<SandboxId, BackendError> {
         self.inner.create_and_start(config).await
     }
@@ -107,12 +104,6 @@ impl SandboxBackendSend for TestBackend {
         id: &SandboxId,
     ) -> Result<Option<EntrypointExit>, BackendError> {
         self.inner.entrypoint_exit(id).await
-    }
-    async fn entrypoint_output(
-        &self,
-        id: &SandboxId,
-    ) -> Result<Option<OutputSnapshot>, BackendError> {
-        self.inner.entrypoint_output(id).await
     }
     fn subscribe(
         &self,
